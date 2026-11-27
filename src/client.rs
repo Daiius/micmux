@@ -31,6 +31,7 @@ pub struct Options {
     pub ssh_args: Vec<String>,
     pub bridge_args: Vec<String>,
     pub armed: bool,
+    /// 連続録音時間の上限。0 なら上限なし。
     pub max_seconds: u64,
     pub source: Source,
     pub bell: bool,
@@ -593,7 +594,7 @@ pub fn run(opts: Options) -> Result<(), String> {
     }
 
     let armed = opts.armed;
-    let max = Duration::from_secs(opts.max_seconds);
+    let max = (opts.max_seconds > 0).then(|| Duration::from_secs(opts.max_seconds));
     let mut client = Client {
         opts,
         writer,
@@ -684,7 +685,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         }
         // 打ち切ったあとは、同じ要求が続いていても自動では再開しない
         if let Some((_, since)) = &client.capture {
-            if since.elapsed() >= max {
+            if max.is_some_and(|max| since.elapsed() >= max) {
                 client.end("時間上限");
                 client.say("連続録音時間の上限に達しました。続けるには `micmux arm`");
             }

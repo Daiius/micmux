@@ -17,7 +17,7 @@ micmux — On-demand microphone forwarding over SSH
 接続元 (マイクのある側):
   micmux connect <host> [options]   接続して録音要求を待つ
       --armed                 最初から録音を許可する（既定は disarmed）
-      --max-seconds <n>       連続録音時間の上限（既定 120）
+      --max-seconds <n>       連続録音時間の上限（既定 120、0 で上限なし）
       --capture-cmd <cmd>     マイク取得に使うコマンド（s16le モノラルを stdout に出すもの）
                               例: 'rec -q -t raw -r 16000 -e signed -b 16 -c 1 -'
       --capture-rate <hz>     --capture-cmd の出力レート（既定 16000）

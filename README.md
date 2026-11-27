@@ -154,7 +154,7 @@ PULSE_SOURCE=micmux.monitor claude
 | オプション | 意味 |
 |---|---|
 | `--armed` | 最初から録音を許可する |
-| `--max-seconds <n>` | 連続録音時間の上限（既定 120 秒） |
+| `--max-seconds <n>` | 連続録音時間の上限（既定 120 秒）。`0` で上限なし |
 | `--remote-cmd <path>` | 接続先での micmux の場所。非対話の SSH では `~/.cargo/bin` が PATH に無いことがある |
 | `--ssh-arg <arg>` | ssh に渡す追加の引数 |
 | `--capture-cmd <cmd>` | マイク取得を外部コマンドに任せる。s16le モノラルを stdout に出すもの |
