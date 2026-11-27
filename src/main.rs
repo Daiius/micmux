@@ -180,6 +180,7 @@ fn parse_bridge(args: Vec<String>) -> Result<bridge::Options, String> {
             "--set-default" => opts.set_default = true,
             "--stop-holdoff-ms" => opts.stop_holdoff = Duration::from_millis(it.number(&a)?),
             "--latency-ms" => opts.latency_ms = it.number(&a)?,
+            "--idle-timeout-ms" => opts.idle_timeout = Duration::from_millis(it.number(&a)?),
             _ => return Err(format!("不明なオプション: {a}")),
         }
     }

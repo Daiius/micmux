@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// 1 フレームの長さ。短いほど遅延は減るが SSH のパケット数が増える。
 const FRAME_MS: u32 = 20;
@@ -230,7 +230,12 @@ fn run_command(ctx: &Ctx, cmd: &str, rate: u32) -> Result<(), String> {
             filled = 0;
         }
     }
-    let status = ctx.child.lock().unwrap().take().map(|mut c| c.wait());
+    // 読む側を先に閉じる。止める指示で抜けた場合、child はまだ録音を続けていて、読まれない
+    // パイプが埋まると書き込みで止まったまま終わらなくなる
+    drop(out);
+    // ロックは取り出すときだけ握る。握ったまま待つと、stop() がロック待ちで止まる
+    let child = ctx.child.lock().unwrap().take();
+    let status = child.map(|c| reap(ctx, c));
     if ctx.stopped() {
         return Ok(());
     }
@@ -238,6 +243,24 @@ fn run_command(ctx: &Ctx, cmd: &str, rate: u32) -> Result<(), String> {
         Some(Ok(s)) if s.success() => Ok(()),
         Some(Ok(s)) => Err(format!("取得コマンドが終了しました ({s})")),
         _ => Err("取得コマンドが終了しました".into()),
+    }
+}
+
+/// 出力を読み終えた取得コマンドの終了を待つ。
+///
+/// child はもう stop() からは見えないので、止める指示が出ていればここで kill する。
+/// stdout だけ閉じて動き続けるコマンドもあるので、指示が無くても長くは待たない。
+fn reap(ctx: &Ctx, mut child: Child) -> io::Result<std::process::ExitStatus> {
+    let grace = Instant::now() + Duration::from_millis(500);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if ctx.stopped() || Instant::now() >= grace {
+            let _ = child.kill();
+            return child.wait();
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -331,4 +354,45 @@ fn run_native(ctx: &Ctx) -> Result<(), String> {
     }
     drop(stream); // ここでデバイスが閉じる
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    fn sink() -> Writer {
+        Arc::new(Mutex::new(Box::new(io::sink())))
+    }
+
+    fn command(cmd: &str) -> Source {
+        Source::Command { cmd: cmd.into(), rate: 16_000 }
+    }
+
+    /// 出力を出し続けているコマンドでも、stop() はすぐに戻る。
+    #[test]
+    fn stop_returns_while_command_is_producing() {
+        for _ in 0..20 {
+            let capture = Capture::start(&command("exec cat /dev/zero"), 1, sink(), |_| {});
+            thread::sleep(Duration::from_millis(5));
+            let t = Instant::now();
+            capture.stop();
+            assert!(t.elapsed() < Duration::from_secs(2), "stop took {:?}", t.elapsed());
+        }
+    }
+
+    /// stdout を閉じたまま動き続けるコマンドでも、取得は終わり、stop() も止まらない。
+    #[test]
+    fn command_closing_stdout_does_not_hang() {
+        let (tx, rx) = channel();
+        let capture = Capture::start(&command("exec 1>&-; exec sleep 30"), 1, sink(), move |r| {
+            let _ = tx.send(r);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5)).expect("取得が終わらない");
+        assert!(result.is_err());
+        let t = Instant::now();
+        capture.stop();
+        assert!(t.elapsed() < Duration::from_secs(2), "stop took {:?}", t.elapsed());
+    }
 }

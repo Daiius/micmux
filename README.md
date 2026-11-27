@@ -96,7 +96,8 @@ Host dev-server
 - 接続先で micmux が PATH に無い場合は `--remote-cmd '~/.cargo/bin/micmux'` を足す
   （非対話の SSH ではログインシェルの設定が読まれないことがある）。
 - 同じホストへ SSH を複数開いた場合、2 本目以降は動いている micmux に相乗りする。
-  すべての SSH が終わった時点で micmux も終わる。
+  すべての SSH が終わった時点で micmux も終わる。ただし、端末から `--watch-pid` 無しで
+  手で起動した micmux に相乗りした場合は、その SSH が終わっても micmux は動き続ける。
 - 起動直後は disarmed。録音の許可は `micmux arm` / `micmux toggle` で切り替える
   （キーバインドに割り当てておくとよい）。裏で動いているあいだは、録音要求を断っても
   ログにしか出ないので気づきにくい。最初から許可するなら `--armed` を足す。
@@ -125,8 +126,9 @@ Match originalhost dev-server exec "micmux connect %n --mux --background --watch
 - `Match originalhost` は、コマンドラインで指定した名前が一致したときだけ発動する。
   IP アドレスや別の名前で接続すると micmux は起動しない。
 - micmux は、端末用の SSH が認証を終えるのを待ってから接続する。
-- `ControlPersist` は必須。最後の SSH を閉じたあとも、指定した時間は接続が保たれる
-  （そのあいだの再接続は認証なしで通る）。
+- `ControlMaster`（`auto` など）、`ControlPath`、`ControlPersist` は必須。どれかが欠けていると
+  micmux は起動時にそう伝えて終わる。`ControlPersist` により、最後の SSH を閉じたあとも
+  指定した時間は接続が保たれる（そのあいだの再接続は認証なしで通る）。
 - 音声と端末の通信が同じ TCP 接続を通る。大量の出力を流している最中は音声が遅れうる。
   通常の使い方では、接続を分けた場合との差は実測で見られなかった（後述）。
 
@@ -182,6 +184,15 @@ micmux connect dev-server --capture-cmd 'rec -q -t raw -r 16000 -e signed -b 16 
    前のセッションの残りが次に混ざらない。
 
 libpulse にはリンクせず、`pactl` と `pacat` を子プロセスとして使う。
+
+接続元がスリープやネットワークの切り替えで消えると、TCP が半開きのまま残り、bridge には
+切断が伝わらない（sshd の既定では何時間も）。そこで client は 10 秒ごとに生存確認を送り、
+bridge は 30 分間何も届かなければ後片付けをして終わる。短いスリープから復帰した接続元が
+そのまま使い続けられるよう、この時間は長めにしてある。sshd 側で `ClientAliveInterval` を
+設定しておくと、ssh の接続そのものも早く片付く。
+
+同じ名前の仮想マイクを使う bridge は 1 つだけ動く。前の bridge が残っているところへ新しい
+bridge が起動すると、前の bridge を終わらせ、その後片付けが済んでから仮想マイクを作る。
 
 ### 接続元: client
 
@@ -245,7 +256,7 @@ macOS (Apple シリコン、内蔵マイク) から Debian へ、往復 約 10 m
 - 接続先のサウンドカードが 1 枚も無く `arecord` も無い環境では、Claude Code が録音方法を
   見つけられない。`alsa-utils` を入れる。
 - 再接続はしない。切れたら `micmux connect` をやり直す。
-- 同時に動かせる client は 1 つ。
+- 同時に動かせる client は 1 つ。接続先では後から接続した方が優先され、前の接続は切れる。
 
 ## 開発
 

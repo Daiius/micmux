@@ -96,7 +96,17 @@ case "$MODE" in
       exit 0
     fi
     mapfile -t todo < "$STATE_FILE"
-    echo "取り除くパッケージ: ${todo[*]}"
+    echo "このスクリプトが入れたパッケージ: ${todo[*]}"
+    # apt-get remove はこれらに依存するパッケージも一緒に消す。記録だけを見せて確認すると、
+    # 利用者の知らないものまで消えるので、実際に消えるものを模擬実行で調べて見せる
+    removing="$(apt-get -s remove "${todo[@]}" | awk '$1 == "Remv" { print $2 }')"
+    if [ -z "$removing" ]; then
+      echo "取り除くものはありません（既に入っていない）"
+      rm -f "$STATE_FILE"
+      exit 0
+    fi
+    echo "実際に取り除かれるパッケージ（依存しているものを含む）:"
+    printf '%s\n' "$removing" | sed 's/^/  /'
     confirm "sudo apt-get remove を実行しますか?" || { echo "中止しました"; exit 1; }
     systemctl --user disable --now pulseaudio.socket pulseaudio.service 2>/dev/null || true
     sudo apt-get remove -y "${todo[@]}"

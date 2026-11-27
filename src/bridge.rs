@@ -34,6 +34,10 @@ pub struct Options {
     pub stop_holdoff: Duration,
     /// 仮想マイクへ流し込むストリームのバッファ長（ジッター吸収）。
     pub latency_ms: u32,
+    /// client から何も届かないまま、これだけ経ったら後片付けをして終わる。
+    /// 接続元がスリープやネットワークの切り替えで消えると TCP が半開きのまま残り、
+    /// stdin の EOF が sshd の設定次第で何時間も来ないため。client は 10 秒ごとに Ping を送る。
+    pub idle_timeout: Duration,
 }
 
 impl Default for Options {
@@ -43,6 +47,10 @@ impl Default for Options {
             set_default: false,
             stop_holdoff: Duration::from_millis(300),
             latency_ms: 60,
+            // 短くしすぎない。接続元が数分スリープしただけなら TCP は生きていることが多く、
+            // 起きた client はそのまま使い続けられる。その前に bridge が終わってしまうと、
+            // 端末の SSH は生きているのに音声だけ使えなくなる
+            idle_timeout: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -218,7 +226,14 @@ impl Playback {
     }
 
     /// 残りを捨てて即座に止める。録音側はもう閉じているので、流し切っても誰も聞いていない。
-    fn stop(mut self) {
+    fn stop(self) {
+        drop(self);
+    }
+}
+
+/// エラーで serve を抜けた場合にも pacat を残さないよう、片付けは Drop で行う。
+impl Drop for Playback {
+    fn drop(&mut self) {
         drop(self.stdin.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -284,6 +299,70 @@ fn install_signal_handlers() {
     }
 }
 
+/// 同じ仮想マイクを使う bridge を 1 つに保つ。前の bridge が残っていれば終わらせ、
+/// その後片付けが済むまで待つ。返ったファイルを閉じるまで（＝プロセスが終わるまで）排他が続く。
+///
+/// 前の bridge は、接続元が消えても無通信の検出まで残る。残ったまま新しい bridge が
+/// 同じ sink を使い始めると、前の bridge が終わるときに module を unload して既定 source を戻し、
+/// 新しいセッションの仮想マイクを壊してしまう。後から来た方を優先する。
+///
+/// 排他には fcntl のレコードロックを使う。持ち主の pid を OS から引けるので、
+/// pid ファイルのように無関係なプロセスを止めてしまうことがない。
+fn take_over(sink: &str) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let path = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir).join(format!("micmux-bridge-{sink}.lock")),
+        None => format!("/tmp/micmux-bridge-{}-{sink}.lock", unsafe { libc::getuid() }).into(),
+    };
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            log!("micmux bridge: {} を開けないので、前の bridge の確認を省きます: {e}", path.display());
+            return None;
+        }
+    };
+    let lock = |cmd: libc::c_int| -> (bool, libc::flock) {
+        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+        fl.l_type = libc::F_WRLCK as _;
+        fl.l_whence = libc::SEEK_SET as _;
+        let ok = unsafe { libc::fcntl(file.as_raw_fd(), cmd, &mut fl) } == 0;
+        (ok, fl)
+    };
+    let started = Instant::now();
+    let (mut termed, mut killed) = (false, false);
+    loop {
+        if lock(libc::F_SETLK).0 {
+            return Some(file);
+        }
+        let (ok, fl) = lock(libc::F_GETLK);
+        let pid = if ok && fl.l_type != libc::F_UNLCK as _ { fl.l_pid } else { 0 };
+        let waited = started.elapsed();
+        if pid > 0 && !termed {
+            log!("micmux bridge: 前の bridge (pid {pid}) を終わらせます");
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            termed = true;
+        } else if pid > 0 && !killed && waited >= Duration::from_secs(3) {
+            // 書き込みで止まっているなどで終われない。後片付けは残るが、壊されるよりよい
+            log!("micmux bridge: 前の bridge (pid {pid}) が終わらないので強制終了します");
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            killed = true;
+        } else if waited >= Duration::from_secs(6) {
+            log!("micmux bridge: 前の bridge の終了を確認できないまま続けます");
+            return None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn send(msg: &Msg) -> io::Result<()> {
     write_msg(&mut io::stdout().lock(), msg)
 }
@@ -306,6 +385,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         Err(_) => return Err("HELLO を受信できませんでした".into()),
     }
 
+    let _exclusive = take_over(&opts.sink_name);
     let mut mic = match VirtualMic::setup(&opts) {
         Ok(m) => m,
         Err(e) => {
@@ -344,6 +424,8 @@ fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>
     let resync_every = Duration::from_secs(30);
     let mut next_resync = Instant::now();
     let mut check_demand = true; // 起動時点で既に録音中のアプリがあるかもしれない
+    // client から最後に何かが届いた時刻。client は待機中も Ping を送り続ける
+    let mut last_rx = Instant::now();
 
     loop {
         if check_demand {
@@ -389,7 +471,14 @@ fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>
             }
             return Ok(());
         }
-        // シグナルに気づけるよう、長くても 1 秒で起きる
+        if now.duration_since(last_rx) >= opts.idle_timeout {
+            log!(
+                "micmux bridge: client から {} 分間何も届かないので終わります",
+                opts.idle_timeout.as_secs() / 60
+            );
+            return Ok(());
+        }
+        // シグナルと無通信に気づけるよう、長くても 1 秒で起きる
         let deadline = stop_at.map_or(next_resync, |t| t.min(next_resync)).min(now + Duration::from_secs(1));
         let ev = match rx.recv_timeout(deadline.saturating_duration_since(now)) {
             Ok(ev) => ev,
@@ -402,6 +491,9 @@ fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
 
+        if matches!(ev, Event::Msg(_)) {
+            last_rx = Instant::now();
+        }
         match ev {
             Event::PulseChanged => check_demand = true,
             Event::PulseGone => {
