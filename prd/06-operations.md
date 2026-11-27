@@ -147,7 +147,29 @@ gap: 録音要求を断ったこと（disarmed）は、裏で動いているあ�
   制御文字の除去・取得の停止など）。
 - 接続先の音声サーバーを使う動作試験は、**利用者の実運用の音声サーバーとは別に立てた、隔離した
   インスタンス**で行う。手順と注意は `AGENTS.md` にある。
-- `cfg(target_os = "macos")` の分岐は、Linux ではビルドできない。変更したら、macOS の実機で確かめる。
+- 対応する Rust は 1.89 以降（`Cargo.toml` の `rust-version`）。
 
-gap: CI は無い。対応する Rust の最低版も決めていない
-（[#7](https://github.com/Daiius/micmux/issues/7)）。
+### 6.1 CI
+
+| workflow | 内容 |
+|---|---|
+| `ci` | ビルド・テスト・lint（警告は 0 件を保つ）を、Linux と macOS で回す。`native` feature の lint と、`rust-version` の版でのビルドも確かめる |
+| `audit` | 依存関係を、既知の脆弱性と照合する（`cargo audit`）。依存を変えた PR と、週に 1 回 |
+| `secret-scan` | 全 ref の全履歴を、Betterleaks で秘密の検査にかける |
+
+- **macOS のランナーで回す**のは、`cfg(target_os = "macos")` の分岐（Core Audio での取得、ソケットの
+  置き場所など）が Linux ではビルドできないため。CI で確かめられるのは、ビルドと、マイクを使わない
+  単体テストまでである。実際のマイクでの録音・マイクの許可・`~/.ssh/config` との連動は、実機で確かめる。
+- workflow の権限は読み取りだけにし、外部の Action は `actions/checkout`（コミットで固定）だけを使う。
+
+### 6.2 秘密の検査
+
+公開リポジトリなので、秘密を push の前と CI で止める（[README](./README.md)「公開リポジトリでの秘匿方針」）。
+
+- 規則は `.betterleaks.toml`。組み込みの規則に、`.env*` をファイル名で止める規則を足している。
+- push 前の検査は `.githooks/pre-push`。clone 後に `./.githooks/install.sh` を一度実行して有効にする。
+- コミット時の検査は、ホストのグローバルな hook に任せ、リポジトリ側では持たない。
+- 秘密の検査が拾うのは、トークンなどの形式の決まったものと `.env*` である。ホスト名やユーザー名のような
+  **環境を特定する情報は拾えない**ので、書く側が気をつける。
+
+gap: 書式（rustfmt）を統一していない（[#7](https://github.com/Daiius/micmux/issues/7)）。
