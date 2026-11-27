@@ -17,6 +17,9 @@ SSH 接続元のマイクを、接続先の仮想マイクとして使えるよ�
 音声は端末の入出力とは別の経路（専用の SSH 接続、または多重化した別チャネル）で送るので、
 tmux やターミナルエミュレーターには依存しない。
 
+仕様と設計の判断は [`prd/`](./prd/) に、決定の経緯は [`prd/_grilling/decisions.md`](./prd/_grilling/decisions.md) にある。
+開発を手伝うエージェント向けの手引きは [`AGENTS.md`](./AGENTS.md)。
+
 ## 現状
 
 2026-11-27 時点。macOS から Debian へ、実際の SSH 越しに Claude Code へ音声入力できることを確認済み。
