@@ -18,9 +18,7 @@ pub struct Decimator {
 impl Decimator {
     /// `in_rate` を 16 kHz へ落とす係数を選ぶ。整数倍でなければ素通し。
     pub fn for_rate(in_rate: u32) -> Decimator {
-        // is_multiple_of は新しい Rust (1.87 以降) でしか使えないので、% のままにしておく
-        #[allow(clippy::manual_is_multiple_of)]
-        let factor = if in_rate > TARGET_RATE && in_rate % TARGET_RATE == 0 {
+        let factor = if in_rate > TARGET_RATE && in_rate.is_multiple_of(TARGET_RATE) {
             (in_rate / TARGET_RATE) as usize
         } else {
             1

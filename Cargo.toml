@@ -2,6 +2,8 @@
 name = "micmux"
 version = "0.1.0"
 edition = "2021"
+# bellmux と同じ最低版。CI の msrv ジョブが、この版でビルドできることを確かめる
+rust-version = "1.89"
 description = "On-demand microphone forwarding over SSH, independent of terminals and applications"
 license = "MIT"
 

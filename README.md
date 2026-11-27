@@ -283,6 +283,27 @@ macOS (Apple シリコン、内蔵マイク) から Debian へ、往復 約 10 m
 
 ```sh
 cargo test
+cargo clippy --all-targets -- -D warnings
 ```
+
+対応する Rust は 1.89 以降（`Cargo.toml` の `rust-version`）。
+
+CI は 3 つある。
+
+- `ci`: ビルド・テスト・lint を Linux と macOS で回す。`rust-version` の版でビルドできることも確かめる。
+- `audit`: 依存関係を、既知の脆弱性と照合する（`cargo audit`）。週に 1 回も回る。
+- `secret-scan`: 全履歴を Betterleaks で秘密の検査にかける。
+
+### 秘密の検査
+
+公開リポジトリなので、秘密（トークン・`.env*` など）を push の前と CI で止める。規則は `.betterleaks.toml`。
+clone したら、一度だけ次を実行する（git 2.55 以降）。
+
+```sh
+./.githooks/install.sh
+```
+
+push の前に、送るコミットだけが検査される。Betterleaks が入っていないホストでは、警告して素通りする
+（CI が最後の砦）。
 
 Linux を接続元にして内蔵のマイク取得を使う場合は `--features native` でビルドする（`libasound2-dev` が必要）。
