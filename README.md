@@ -293,7 +293,8 @@ cargo clippy --all-targets -- -D warnings
 
 CI は 3 つある。
 
-- `ci`: ビルド・テスト・lint を Linux と macOS で回す。`rust-version` の版でビルドできることも確かめる。
+- `ci`: ビルド・テスト・lint と、音声の通しの試験（`scripts/e2e-linux.sh`）を Linux で回す。`rust-version` の版で
+  ビルドできることも確かめる。文書だけの変更では回らない。macOS 向けのコードは、CI では確かめていない。
 - `audit`: 依存関係を、既知の脆弱性と照合する（`cargo audit`）。週に 1 回も回る。
 - `secret-scan`: 全履歴を Betterleaks で秘密の検査にかける。
 

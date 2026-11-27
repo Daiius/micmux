@@ -1,12 +1,16 @@
 name: ci
 
-# ビルド・テスト・lint。macOS 向けの分岐（Core Audio での取得、ソケットの置き場所など）は
-# Linux ではビルドできないので、macOS のランナーでも回す。
+# ビルド・テスト・lint と、音声の通しの試験。すべて Linux のランナーで回す。
+# macOS 向けの分岐（Core Audio での取得、ソケットの置き場所など）は、ここでは確かめない。
+# 利用者の実機で確かめる（prd/06 §6.1）。
 
 on:
+  # 文書だけの変更では回さない（秘密の検査は別の workflow で、文書にも回る）
   pull_request:
+    paths-ignore: ["**.md", "prd/**"]
   push:
     branches: [main]
+    paths-ignore: ["**.md", "prd/**"]
 
 permissions:
   contents: read
@@ -46,8 +50,10 @@ jobs:
       - name: Clippy (native feature)
         run: cargo clippy --locked --all-targets --features native -- -D warnings
 
-  macos:
-    runs-on: macos-latest
+  # 代役のマイク → client → bridge → 仮想マイクの流れで、音が届くことを確かめる。
+  # 接続元を Linux にする場合の実機が無いので、その経路（内蔵の取得）もここで通す
+  e2e:
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -55,15 +61,21 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
+          rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
           cargo --version
-      - name: Build
-        run: cargo build --locked
-      - name: Test
-        run: cargo test --locked
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+      # libasound2-plugins: ALSA から PulseAudio へ繋ぐプラグイン（内蔵の取得が通る経路）
+      - name: Install PulseAudio and ALSA
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pulseaudio pulseaudio-utils libasound2-plugins libasound2-dev
+      - name: Build (native feature)
+        run: cargo build --locked --features native
+      - name: End-to-end (capture command)
+        run: ./scripts/e2e-linux.sh target/debug/micmux
+      - name: End-to-end (native capture)
+        run: E2E_NATIVE=1 ./scripts/e2e-linux.sh target/debug/micmux
 
   # Cargo.toml の rust-version でビルドできることを確かめる
   msrv:
