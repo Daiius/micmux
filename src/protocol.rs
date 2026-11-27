@@ -193,6 +193,22 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<Option<Msg>> {
     Msg::decode(head[0], &payload).map(Some)
 }
 
+/// 読めたメッセージを順に `deliver` へ渡す。読めなくなるか、`deliver` が false を返したら戻る。
+/// 戻り値は読めなくなった理由（メッセージ境界でのきれいな EOF や、`deliver` が断った場合は `None`）。
+pub fn forward<R: Read>(r: &mut R, mut deliver: impl FnMut(Msg) -> bool) -> Option<io::Error> {
+    loop {
+        match read_msg(r) {
+            Ok(Some(m)) => {
+                if !deliver(m) {
+                    return None;
+                }
+            }
+            Ok(None) => return None,
+            Err(e) => return Some(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

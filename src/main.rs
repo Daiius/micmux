@@ -4,9 +4,11 @@
 mod bridge;
 mod capture;
 mod client;
+mod control;
 mod debug;
 mod protocol;
 mod resample;
+mod ssh;
 
 use std::process::{Command, ExitCode};
 use std::time::Duration;
@@ -48,10 +50,10 @@ fn main() -> ExitCode {
     let result = match cmd.as_str() {
         "connect" => parse_connect(args).and_then(client::run),
         "bridge" => parse_bridge(args).and_then(bridge::run),
-        "arm" | "disarm" | "toggle" => client::send_control(&cmd).map(|r| println!("{r}")),
+        "arm" | "disarm" | "toggle" => control::send_control(&cmd).map(|r| println!("{r}")),
         "status" => {
             let json = args.iter().any(|a| a == "--json");
-            client::send_control(if json { "status-json" } else { "status" }).map(|r| println!("{r}"))
+            control::send_control(if json { "status-json" } else { "status" }).map(|r| println!("{r}"))
         }
         "doctor" => doctor(),
         "debug" => parse_debug(args).and_then(|(host, remote, source)| debug::run(host, &remote, &source)),

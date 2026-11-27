@@ -96,7 +96,7 @@ pub struct Capture {
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
     thread: Option<JoinHandle<()>>,
-    pub stats: Arc<Stats>,
+    stats: Arc<Stats>,
 }
 
 impl Capture {
@@ -140,14 +140,20 @@ impl Capture {
     /// 取得を止め、デバイスが閉じるまで待つ。
     pub fn stop(mut self) -> Arc<Stats> {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(mut c) = self.child.lock().unwrap().take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        kill_child(&self.child);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
         self.stats.clone()
+    }
+}
+
+/// 取得コマンドが置かれていれば取り出して止める。stop() と取得スレッドのどちらが先でも 1 回だけ効く。
+fn kill_child(slot: &Mutex<Option<Child>>) {
+    let child = slot.lock().unwrap().take();
+    if let Some(mut c) = child {
+        let _ = c.kill();
+        let _ = c.wait();
     }
 }
 
@@ -206,10 +212,7 @@ fn run_command(ctx: &Ctx, cmd: &str, rate: u32) -> Result<(), String> {
     *ctx.child.lock().unwrap() = Some(child);
     if ctx.stopped() {
         // 起動と停止が行き違った場合。stop() が child を見る前だったかもしれないので自分で片付ける
-        if let Some(mut c) = ctx.child.lock().unwrap().take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        kill_child(&ctx.child);
         return Ok(());
     }
 

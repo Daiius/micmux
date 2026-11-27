@@ -3,8 +3,7 @@
 //! 何も変更しない。マイクは合計で数秒だけ開く。
 
 use crate::capture::{self, Source};
-use crate::client;
-use std::os::unix::process::CommandExt;
+use crate::{client, control, ssh};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -60,9 +59,9 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
     println!("  PATH 上の micmux: {}", capture_output(Command::new("sh").args(["-c", "command -v micmux"])).trim());
 
     section("動いている micmux");
-    let socket = client::control_path();
+    let socket = control::control_path();
     println!("  操作用ソケット: {} ({})", socket.display(), if socket.exists() { "ある" } else { "無い" });
-    match client::send_control("status") {
+    match control::send_control("status") {
         Ok(s) => println!("  status: {s}"),
         Err(e) => println!("  status: {e}"),
     }
@@ -86,12 +85,12 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
             "requesttty ", "controlmaster ", "controlpath ", "controlpersist ", "identityagent ",
             "proxyjump ", "proxycommand ", "batchmode ",
         ];
-        let conf = capture_output(Command::new("ssh").env(client::INTERNAL_ENV, "1").args(["-G", host]));
+        let conf = capture_output(ssh::command().args(["-G", host]));
         indent(&conf.lines().filter(|l| keys.iter().any(|k| l.starts_with(k))).collect::<Vec<_>>().join("\n"));
 
         section("端末なしでの接続（裏で動く micmux と同じ条件）");
         let remote = format!("echo \"remote PATH=$PATH\"; {remote_cmd} --version; {remote_cmd} doctor");
-        indent(&capture_output(Command::new("ssh").env(client::INTERNAL_ENV, "1").args([
+        indent(&capture_output(ssh::command().args([
             "-T",
             "-o", "BatchMode=yes",
             "-o", "ControlMaster=no",
@@ -119,13 +118,7 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
     if let Source::Command { cmd: c, rate } = source {
         cmd.args(["--capture-cmd", c, "--capture-rate", &rate.to_string()]);
     }
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    indent(&capture_output(&mut cmd));
+    indent(&capture_output(client::in_new_session(&mut cmd)));
 
     println!("\n以上です。ホスト名やユーザー名が含まれるので、貼る前に目を通してください。");
     Ok(())

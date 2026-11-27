@@ -5,15 +5,15 @@
 //! - client から届いた PCM を仮想マイクへ流す
 //!
 //! PulseAudio とのやりとりは `pactl` / `pacat` の子プロセスで行う。libpulse にリンクしないので
-//! ビルドに開発ヘッダが要らず、pipewire-pulse でもそのまま動く。
+//! ビルドに開発ヘッダが要らない。pipewire-pulse でも同じコマンドが使える（動作は未確認）。
 //!
 //! stdout はプロトコル専用。ログはすべて stderr に出す。
 
-use crate::protocol::{read_msg, write_msg, Msg, VERSION};
+use crate::protocol::{self, end_reason, write_msg, Msg, VERSION};
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -224,14 +224,10 @@ impl Playback {
             None => Ok(()),
         }
     }
-
-    /// 残りを捨てて即座に止める。録音側はもう閉じているので、流し切っても誰も聞いていない。
-    fn stop(self) {
-        drop(self);
-    }
 }
 
-/// エラーで serve を抜けた場合にも pacat を残さないよう、片付けは Drop で行う。
+/// drop したら、残りを捨てて即座に止める。録音側はもう閉じているので、流し切っても誰も聞いていない。
+/// エラーで serve を抜けた場合にも pacat を残さないよう、止めるのは drop に任せる。
 impl Drop for Playback {
     fn drop(&mut self) {
         drop(self.stdin.take());
@@ -242,18 +238,8 @@ impl Drop for Playback {
 
 fn spawn_reader(tx: SyncSender<Event>) {
     thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
-        loop {
-            let ev = match read_msg(&mut stdin) {
-                Ok(Some(m)) => Event::Msg(m),
-                Ok(None) => Event::Closed(None),
-                Err(e) => Event::Closed(Some(e)),
-            };
-            let done = matches!(ev, Event::Closed(_));
-            if tx.send(ev).is_err() || done {
-                return;
-            }
-        }
+        let closed = protocol::forward(&mut io::stdin().lock(), |m| tx.send(Event::Msg(m)).is_ok());
+        let _ = tx.send(Event::Closed(closed));
     });
 }
 
@@ -270,10 +256,10 @@ fn spawn_watcher(tx: SyncSender<Event>) -> io::Result<Child> {
         for line in BufReader::new(out).lines() {
             let Ok(line) = line else { break };
             // 録音ストリームの増減・cork の変化、および source 自体の作り直しを拾う
-            if line.contains("source-output") || line.contains("on source #") {
-                if tx.send(Event::PulseChanged).is_err() {
-                    return;
-                }
+            if (line.contains("source-output") || line.contains("on source #"))
+                && tx.send(Event::PulseChanged).is_err()
+            {
+                return;
             }
         }
         let _ = tx.send(Event::PulseGone);
@@ -409,7 +395,8 @@ pub fn run(opts: Options) -> Result<(), String> {
     result
 }
 
-fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>) -> Result<(), String> {
+/// 録音中の pacat (`playback`) はこの関数のローカルなので、どの経路で抜けても drop で止まる。
+fn serve(opts: &Options, mic: &VirtualMic, rx: &Receiver<Event>) -> Result<(), String> {
     let io_err = |e: io::Error| format!("client への送信に失敗: {e}");
     send(&Msg::HelloAck { version: VERSION, source: mic.source_name() }).map_err(io_err)?;
     log!("micmux bridge: 仮想マイク '{}' を用意しました", mic.source_name());
@@ -451,10 +438,7 @@ fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>
             if now >= t {
                 stop_at = None;
                 if let Some((session, started)) = active.take() {
-                    let bytes = playback.as_ref().map_or(0, |p| p.bytes);
-                    if let Some(p) = playback.take() {
-                        p.stop();
-                    }
+                    let bytes = playback.take().map_or(0, |p| p.bytes);
                     log!(
                         "micmux bridge: 録音終了 → STOP (session {session}, {:.1}s, 受信 {bytes} bytes)",
                         started.elapsed().as_secs_f32()
@@ -466,9 +450,6 @@ fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>
         }
         if TERMINATE.load(Ordering::SeqCst) {
             log!("micmux bridge: 終了シグナルを受けました");
-            if let Some(p) = playback.take() {
-                p.stop();
-            }
             return Ok(());
         }
         if now.duration_since(last_rx) >= opts.idle_timeout {
@@ -503,17 +484,9 @@ fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>
             }
             Event::Closed(None) => {
                 log!("micmux bridge: client が切断しました");
-                if let Some(p) = playback.take() {
-                    p.stop();
-                }
                 return Ok(());
             }
-            Event::Closed(Some(e)) => {
-                if let Some(p) = playback.take() {
-                    p.stop();
-                }
-                return Err(format!("client からの受信に失敗: {e}"));
-            }
+            Event::Closed(Some(e)) => return Err(format!("client からの受信に失敗: {e}")),
             Event::Msg(msg) => match msg {
                 Msg::AudioBegin { session, rate, channels } => {
                     if active.map(|a| a.0) != Some(session) {
@@ -523,9 +496,7 @@ fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>
                         log!("micmux bridge: 扱えない音声形式 ({rate} Hz, {channels} ch)");
                         continue;
                     }
-                    if let Some(p) = playback.take() {
-                        p.stop();
-                    }
+                    playback = None; // 前の pacat を止めてから起動し直す
                     match Playback::start(&mic.sink, rate, channels, opts.latency_ms) {
                         Ok(p) => playback = Some(p),
                         Err(e) => log!("micmux bridge: pacat を起動できません: {e}"),
@@ -546,18 +517,14 @@ fn serve(opts: &Options, mic: &VirtualMic, rx: &std::sync::mpsc::Receiver<Event>
                         }
                         if let Err(e) = p.write(&pcm) {
                             log!("micmux bridge: 仮想マイクへの書き込みに失敗: {e}");
-                            if let Some(p) = playback.take() {
-                                p.stop();
-                            }
+                            playback = None;
                         }
                     }
                 }
                 Msg::AudioEnd { session, reason } => {
                     if active.map(|a| a.0) == Some(session) {
-                        if let Some(p) = playback.take() {
-                            p.stop();
-                        }
-                        if reason != crate::protocol::end_reason::STOPPED {
+                        playback = None;
+                        if reason != end_reason::STOPPED {
                             log!("micmux bridge: session {session}: client が音声を送りません (reason {reason})");
                         }
                     }
