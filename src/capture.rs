@@ -191,8 +191,10 @@ impl Ctx {
         }
         self.stats.bytes_sent.fetch_add(pcm.len() as u64, Ordering::Relaxed);
         let peak = pcm
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs() as u64)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| i16::from_le_bytes(b).unsigned_abs() as u64)
             .max()
             .unwrap_or(0);
         self.stats.peak.fetch_max(peak, Ordering::Relaxed);
