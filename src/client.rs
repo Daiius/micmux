@@ -34,6 +34,11 @@ pub struct Options {
     pub max_seconds: u64,
     pub source: Source,
     pub bell: bool,
+    /// 端末から切り離して裏で動く（ssh の LocalCommand から起動する用）。
+    pub background: bool,
+    /// このプロセスが生きているあいだだけ動く。裏で動かすときの終了条件。
+    pub watch_pid: Option<i32>,
+    pub log_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,6 +69,8 @@ enum Event {
     Msg(Msg),
     Closed(Option<io::Error>),
     Control(Cmd, Option<SyncSender<String>>),
+    /// 別の ssh からの「自分が生きているあいだも動いていてほしい」という登録。
+    Watch { pid: i32, host: String, reply: SyncSender<String> },
     CaptureExit(u32, Result<(), String>),
 }
 
@@ -90,10 +97,77 @@ pub fn send_control(cmd: &str) -> Result<String, String> {
     Ok(reply.trim_end().to_string())
 }
 
+/// 既に動いている `micmux connect` があるか。
+fn another_instance_running() -> bool {
+    UnixStream::connect(control_path()).is_ok()
+}
+
+fn alive(pid: i32) -> bool {
+    // シグナル 0 は存在確認だけ。権限が無くて失敗した場合もプロセスは存在している
+    unsafe { libc::kill(pid, 0) == 0 || *errno_location() == libc::EPERM }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__error()
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+
+/// 切り離されたあとの自分であることを示す環境変数。
+const DETACHED_ENV: &str = "MICMUX_DETACHED";
+
+/// 端末から切り離す。自分自身を新しいセッションで起動し直し、親はすぐに戻る
+/// （ssh の LocalCommand を待たせない）。戻り値が false なら親側で、そのまま終了してよい。
+///
+/// fork するだけでは済ませない。macOS では fork しただけの子プロセスから Core Audio などの
+/// システムフレームワークを使うと動作が保証されないので、必ず exec し直す。
+fn detach(log: &std::path::Path) -> Result<bool, String> {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os(DETACHED_ENV).is_some() {
+        return Ok(true);
+    }
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map_err(|e| format!("{}: {e}", log.display()))
+    };
+    let exe = std::env::current_exe().map_err(|e| format!("自分の実行ファイルの場所がわかりません: {e}"))?;
+    let mut cmd = Command::new(exe);
+    cmd.args(std::env::args_os().skip(1))
+        .env(DETACHED_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(open()?)
+        .stderr(open()?);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().map_err(|e| format!("裏での起動に失敗しました: {e}"))?;
+    Ok(false)
+}
+
+pub fn default_log_path() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into())).join(".local/state")
+    });
+    base.join("micmux").join("client.log")
+}
+
 fn spawn_control_socket(tx: Sender<Event>) -> Result<PathBuf, String> {
     let path = control_path();
     if path.exists() {
-        if UnixStream::connect(&path).is_ok() {
+        if another_instance_running() {
             return Err(format!("別の micmux connect が動いています ({})", path.display()));
         }
         let _ = std::fs::remove_file(&path); // 前回の残骸
@@ -109,16 +183,24 @@ fn spawn_control_socket(tx: Sender<Event>) -> Result<PathBuf, String> {
             if BufReader::new(reader).read_line(&mut line).is_err() {
                 continue;
             }
-            let reply = match Cmd::parse(&line) {
+            let (rtx, rrx) = sync_channel(1);
+            let mut words = line.split_whitespace();
+            let event = match (words.next(), words.next().and_then(|p| p.parse().ok()), words.next()) {
+                (Some("watch"), Some(pid), Some(host)) => {
+                    Some(Event::Watch { pid, host: host.to_string(), reply: rtx })
+                }
                 // 空行での toggle は端末からの操作専用
-                Some(cmd) if !line.trim().is_empty() => {
-                    let (rtx, rrx) = sync_channel(1);
-                    if tx.send(Event::Control(cmd, Some(rtx))).is_err() {
+                _ if line.trim().is_empty() => None,
+                _ => Cmd::parse(&line).map(|cmd| Event::Control(cmd, Some(rtx))),
+            };
+            let reply = match event {
+                Some(ev) => {
+                    if tx.send(ev).is_err() {
                         return;
                     }
                     rrx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| "timeout".into())
                 }
-                _ => "error: unknown command".into(),
+                None => "error: unknown command".into(),
             };
             let _ = writeln!(conn, "{reply}");
         }
@@ -148,12 +230,29 @@ fn spawn_transport(opts: &Options) -> io::Result<Child> {
                 "-o", "ControlPath=none",
                 "-o", "ServerAliveInterval=10",
                 "-o", "ServerAliveCountMax=3",
+                // ~/.ssh/config の LocalCommand から起動された場合に、自分の接続でまた
+                // LocalCommand が走って micmux が micmux を呼び続けるのを防ぐ
+                "-o", "PermitLocalCommand=no",
             ]);
+            if opts.background {
+                // 端末が無いのでパスフレーズなどを尋ねられない。待ち続けずに失敗させる
+                c.args(["-o", "BatchMode=yes"]);
+            }
             c.args(&opts.ssh_args).arg(&opts.host).arg("--").arg(remote);
             c
         }
     };
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+}
+
+/// ログ用の現地時刻 (HH:MM:SS)。
+pub fn clock() -> String {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
 }
 
 struct Client {
@@ -165,11 +264,13 @@ struct Client {
     capture: Option<(Capture, Instant)>,
     rtt_ms: Option<u128>,
     sessions: u64,
+    /// 生きているあいだ動き続ける対象。一度でも登録され、すべて居なくなったら終了する。
+    watched: Vec<i32>,
 }
 
 impl Client {
     fn say(&self, text: &str) {
-        eprintln!("micmux: {text}");
+        eprintln!("{} micmux: {text}", clock());
     }
 
     fn send(&self, msg: &Msg) -> io::Result<()> {
@@ -193,10 +294,11 @@ impl Client {
         let stats = capture.stop();
         let dropped = stats.dropped_samples.load(Ordering::Relaxed);
         self.say(&format!(
-            "○ 録音停止 ({why}; session {session}, {:.1}s, {} KB, 最初の音声まで {} ms{})",
+            "○ 録音停止 ({why}; session {session}, {:.1}s, {} KB, 最初の音声まで {} ms, 最大音量 {}{})",
             started.elapsed().as_secs_f32(),
             stats.bytes_sent.load(Ordering::Relaxed) / 1024,
             stats.first_audio_ms.load(Ordering::Relaxed),
+            crate::capture::describe_peak(stats.peak.load(Ordering::Relaxed)),
             if dropped > 0 { format!(", 取りこぼし {dropped} サンプル") } else { String::new() },
         ));
     }
@@ -292,6 +394,41 @@ impl Client {
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
+    if another_instance_running() {
+        // 同じホストへ 2 本目の ssh を張った場合。動いている方に相乗りして終わる
+        return match opts.watch_pid {
+            Some(pid) => {
+                let reply = send_control(&format!("watch {pid} {}", opts.host))?;
+                if reply == "ok" || opts.background {
+                    if reply != "ok" {
+                        eprintln!("micmux: {reply}");
+                    }
+                    Ok(())
+                } else {
+                    Err(reply)
+                }
+            }
+            None => Err(format!("別の micmux connect が動いています ({})", control_path().display())),
+        };
+    }
+    if opts.background {
+        let log = opts.log_path.clone().unwrap_or_else(default_log_path);
+        if !detach(&log)? {
+            return Ok(());
+        }
+    }
+    let watch_pid = opts.watch_pid;
+    if opts.background {
+        eprintln!(
+            "{} micmux: 起動 (version {}, pid {}, host {}, watch-pid {:?}, 取得 {:?})",
+            clock(),
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            opts.host,
+            watch_pid,
+            opts.source,
+        );
+    }
     let mut child = spawn_transport(&opts).map_err(|e| format!("接続コマンドを起動できません: {e}"))?;
     let writer: Writer = Arc::new(Mutex::new(Box::new(child.stdin.take().expect("piped stdin"))));
     let mut from_bridge = child.stdout.take().expect("piped stdout");
@@ -371,6 +508,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         capture: None,
         rtt_ms: None,
         sessions: 0,
+        watched: watch_pid.into_iter().collect(),
     };
     client.say(&format!(
         "{} に接続しました。仮想マイク: {source_name}",
@@ -417,6 +555,17 @@ pub fn run(opts: Options) -> Result<(), String> {
                     break Ok(());
                 }
             },
+            Some(Event::Watch { pid, host, reply }) => {
+                let text = if host != client.opts.host {
+                    format!("error: {} に接続中のため {host} には使えません", client.opts.host)
+                } else {
+                    if !client.watched.contains(&pid) {
+                        client.watched.push(pid);
+                    }
+                    "ok".into()
+                };
+                let _ = reply.send(text);
+            }
             Some(Event::CaptureExit(session, result)) => {
                 if client.capture.as_ref().is_some_and(|(c, _)| c.session == session) {
                     client.end("取得が終了");
@@ -429,6 +578,15 @@ pub fn run(opts: Options) -> Result<(), String> {
         }
 
         // 連続録音時間の上限
+        // 登録された ssh がすべて終わったら、こちらも終わる
+        if !client.watched.is_empty() {
+            client.watched.retain(|&pid| alive(pid));
+            if client.watched.is_empty() {
+                client.end("終了");
+                client.say("監視対象の ssh がすべて終了したので終わります");
+                break Ok(());
+            }
+        }
         // 打ち切ったあとは、同じ要求が続いていても自動では再開しない
         if let Some((_, since)) = &client.capture {
             if since.elapsed() >= max {

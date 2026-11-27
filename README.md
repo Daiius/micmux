@@ -18,7 +18,7 @@ SSH 接続元のマイクを、接続先の仮想マイクとして使えるよ�
 
 ## 現状
 
-2026-11-27 時点。**接続先側は実機で確認済み、接続元の macOS 側は未確認。**
+2026-11-27 時点。macOS から Debian へ、実際の SSH 越しに Claude Code へ音声入力できることを確認済み。
 
 | 項目 | 状態 |
 |---|---|
@@ -26,8 +26,9 @@ SSH 接続元のマイクを、接続先の仮想マイクとして使えるよ�
 | 録音の開始・終了を PulseAudio の録音ストリームの有無で検出できる | 実測で確認 |
 | disarmed では録音要求を断る / arm で受け付ける | 実測で確認 |
 | 接続元の異常終了・端末ごとの切断・bridge への SIGTERM で接続先が元に戻る | 実測で確認 |
-| cpal によるマイク取得のコード | Linux (ALSA) で動作確認。**macOS (Core Audio) では未ビルド・未実行** |
-| 本物の SSH 越しの転送 | **未確認**（同一マシン上で `--transport` を使って確認した） |
+| macOS (Core Audio) でのマイク取得 | 実測で確認。Linux (ALSA) でも動作確認 |
+| 実際の SSH 越しの転送と、日本語の文字起こし | 実測で確認 |
+| 裏での起動、複数の SSH の相乗り、SSH 終了への追従 | Linux 上で確認。**`~/.ssh/config` の `LocalCommand` からの起動と macOS では未確認** |
 | pipewire-pulse での動作 | 未確認（PulseAudio 17.0 で確認） |
 | Codex CLI | 未確認。0.162.1 の Linux 版バイナリには録音の実装が見当たらない（後述） |
 
@@ -78,6 +79,34 @@ micmux status --json
 接続先では、いつも通り SSH + tmux の中でアプリを使う。Claude Code なら `/voice` で音声入力を有効にし、
 スペースキーを押しているあいだ録音される。
 
+### ssh に連動して自動で起動する
+
+`~/.ssh/config` に 2 行足すと、`ssh dev-server` したときに micmux が裏で立ち上がり、
+その SSH を閉じると終了する。別の端末で `micmux connect` を実行する必要がなくなる。
+
+```
+Host dev-server
+    PermitLocalCommand yes
+    LocalCommand micmux connect %n --set-default --background --watch-pid $PPID
+```
+
+- 同じホストへ SSH を複数開いた場合、2 本目以降は動いている micmux に相乗りする。
+  すべての SSH が終わった時点で micmux も終わる。
+- 起動直後は disarmed。録音の許可は `micmux arm` / `micmux toggle` で切り替える
+  （キーバインドに割り当てておくとよい）。
+- 裏で動いているあいだの表示は `~/.local/state/micmux/client.log` に出る。
+- 端末が無いのでパスフレーズを尋ねられない。鍵は ssh-agent に載せておく。
+- `LocalCommand` は `git` や `scp` がそのホストへ繋ぐときにも走る。その場合 micmux は
+  接続が終わるのと同時に終了する。
+
+うまく動かないときは、接続元で次を実行すると状況をまとめて表示する。
+micmux の版、動いているプロセス、ログの末尾、ssh の設定、端末なしでの接続可否、
+マイクから音が取れるか（端末から直接と、切り離した状態の両方）を出す。
+
+```sh
+micmux debug dev-server
+```
+
 ### 録音デバイスの選ばれ方
 
 `--set-default` を付けると、接続中だけ仮想マイクを接続先の既定の録音デバイスにする（切断時に戻す）。
@@ -97,6 +126,8 @@ PULSE_SOURCE=micmux.monitor claude
 | `--ssh-arg <arg>` | ssh に渡す追加の引数 |
 | `--capture-cmd <cmd>` | マイク取得を外部コマンドに任せる。s16le モノラルを stdout に出すもの |
 | `--transport <cmd>` | ssh の代わりに使う接続コマンド |
+| `--background` | 端末から切り離して裏で動く |
+| `--watch-pid <pid>` | 指定したプロセスが終わったら自分も終わる |
 
 内蔵のマイク取得がうまく動かない場合は、SoX で代用できる。
 
@@ -155,9 +186,10 @@ Linux 版では録音できない可能性が高いが、実際に起動して�
 
 ## 既知の制限
 
-- **発話の冒頭が欠ける。** 録音要求が来てからマイクを開くので、開くまでの音は届かない。
-  Linux 上の測定では START から最初の音声まで 0.6〜1.0 秒かかった（macOS では未測定）。
-  キーを押してひと呼吸おいてから話す必要がある。
+- **発話の冒頭が欠けうる。** 録音要求が来てからマイクを開くので、開くまでの音は届かない。
+  START から最初の音声が届くまでの実測値は、macOS (Core Audio) で約 110 ms、
+  Linux (ALSA → PulseAudio) で 0.6〜1.0 秒。macOS からなら実用上ほぼ気にならないが、
+  Linux を接続元にする場合はキーを押してひと呼吸おいてから話す必要がある。
 - 送信が詰まっている最中は、取得スレッドの停止が送信の完了待ちになる。
 - 接続先のサウンドカードが 1 枚も無く `arecord` も無い環境では、Claude Code が録音方法を
   見つけられない。`alsa-utils` を入れる。

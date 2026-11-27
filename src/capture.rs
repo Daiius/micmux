@@ -34,6 +34,61 @@ pub struct Stats {
     pub dropped_samples: AtomicU64,
     /// 取得開始の指示から最初の PCM を送るまで (ms)。
     pub first_audio_ms: AtomicU64,
+    /// 送ったサンプルの最大振幅 (0〜32768)。0 のままなら完全な無音。
+    pub peak: AtomicU64,
+}
+
+/// 最大振幅を人が読める形にする。
+pub fn describe_peak(peak: u64) -> String {
+    if peak == 0 {
+        return "0 (完全な無音。マイクの許可が下りていない可能性)".into();
+    }
+    format!("{:.0} dBFS", 20.0 * (peak as f64 / 32768.0).log10())
+}
+
+/// マイクを `duration` だけ開いて、取れた音の概要を返す。通信はしない。
+pub fn mic_test(source: &Source, duration: std::time::Duration) -> Result<String, String> {
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let failure = Arc::new(Mutex::new(None));
+    let writer: Writer = Arc::new(Mutex::new(Box::new(Shared(buf.clone()))));
+    let capture = {
+        let failure = failure.clone();
+        Capture::start(source, 1, writer, move |r| *failure.lock().unwrap() = r.err())
+    };
+    thread::sleep(duration);
+    let stats = capture.stop();
+    if let Some(e) = failure.lock().unwrap().take() {
+        return Err(e);
+    }
+    let bytes = buf.lock().unwrap().clone();
+    let (mut rate, mut samples) = (0u32, 0u64);
+    let mut reader = &bytes[..];
+    while let Ok(Some(msg)) = crate::protocol::read_msg(&mut reader) {
+        match msg {
+            Msg::AudioBegin { rate: r, .. } => rate = r,
+            Msg::Audio { pcm, .. } => samples += pcm.len() as u64 / 2,
+            _ => {}
+        }
+    }
+    if rate == 0 || samples == 0 {
+        return Err("音声が 1 サンプルも取れませんでした".into());
+    }
+    Ok(format!(
+        "{rate} Hz で {:.2} 秒ぶん取得、最初の音声まで {} ms、最大音量 {}",
+        samples as f64 / rate as f64,
+        stats.first_audio_ms.load(Ordering::Relaxed),
+        describe_peak(stats.peak.load(Ordering::Relaxed)),
+    ))
 }
 
 pub struct Capture {
@@ -129,6 +184,12 @@ impl Ctx {
                 .store(self.began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
         self.stats.bytes_sent.fetch_add(pcm.len() as u64, Ordering::Relaxed);
+        let peak = pcm
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs() as u64)
+            .max()
+            .unwrap_or(0);
+        self.stats.peak.fetch_max(peak, Ordering::Relaxed);
         self.send(&Msg::Audio { session: self.session, pcm }).map_err(|e| format!("送信に失敗: {e}"))
     }
 }

@@ -4,6 +4,7 @@
 mod bridge;
 mod capture;
 mod client;
+mod debug;
 mod protocol;
 mod resample;
 
@@ -26,8 +27,13 @@ micmux — On-demand microphone forwarding over SSH
       --sink-name <name>      仮想マイクの名前（既定 micmux → 録音デバイスは micmux.monitor）
       --set-default           接続中だけ仮想マイクを接続先の既定の録音デバイスにする
       --no-bell               断ったときにベルを鳴らさない
+      --background            端末から切り離して裏で動く（ログは ~/.local/state/micmux/client.log）
+      --watch-pid <pid>       このプロセスが終わったら自分も終わる
+      --log <path>            --background のときのログの出力先
   micmux arm | disarm | toggle      動いている connect の録音許可を切り替える
   micmux status [--json]            動いている connect の状態を表示する
+  micmux debug [<host>]             不具合調査用に、接続元の状況をまとめて表示する
+      --remote-cmd / --capture-cmd / --capture-rate は connect と同じ
 
 接続先 (アプリが動く側):
   micmux bridge [options]           connect が SSH 越しに起動する（手で実行する必要はない）
@@ -46,6 +52,11 @@ fn main() -> ExitCode {
             client::send_control(if json { "status-json" } else { "status" }).map(|r| println!("{r}"))
         }
         "doctor" => doctor(),
+        "debug" => parse_debug(args).and_then(|(host, remote, source)| debug::run(host, &remote, &source)),
+        // debug が切り離した状態でのマイク取得を試すために自分を呼ぶ
+        "mic-test" => parse_debug(args).and_then(|(_, _, source)| {
+            capture::mic_test(&source, Duration::from_millis(1500)).map(|s| println!("{s}"))
+        }),
         "--version" | "-V" | "version" => {
             println!("micmux {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -97,6 +108,9 @@ fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
         max_seconds: 120,
         source: capture::Source::Native,
         bell: true,
+        background: false,
+        watch_pid: None,
+        log_path: None,
     };
     let mut capture_cmd = None;
     let mut capture_rate = resample::TARGET_RATE;
@@ -115,6 +129,9 @@ fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
                 opts.bridge_args.push(checked_name(it.value(&a)?)?);
             }
             "--set-default" => opts.bridge_args.push(a),
+            "--background" => opts.background = true,
+            "--watch-pid" => opts.watch_pid = Some(it.number(&a)?),
+            "--log" => opts.log_path = Some(it.value(&a)?.into()),
             _ if a.starts_with('-') => return Err(format!("不明なオプション: {a}")),
             _ if host.is_none() => host = Some(a),
             _ => return Err(format!("余分な引数: {a}")),
@@ -129,6 +146,25 @@ fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
         (None, None) => return Err(format!("接続先を指定してください\n\n{USAGE}")),
     };
     Ok(opts)
+}
+
+fn parse_debug(args: Vec<String>) -> Result<(Option<String>, String, capture::Source), String> {
+    let mut it = Args(args.into_iter());
+    let (mut host, mut remote, mut cmd, mut rate) = (None, "micmux".to_string(), None, resample::TARGET_RATE);
+    while let Some(a) = it.0.next() {
+        match a.as_str() {
+            "--remote-cmd" => remote = it.value(&a)?,
+            "--capture-cmd" => cmd = Some(it.value(&a)?),
+            "--capture-rate" => rate = it.number(&a)?,
+            _ if a.starts_with('-') => return Err(format!("不明なオプション: {a}")),
+            _ => host = Some(a),
+        }
+    }
+    let source = match cmd {
+        Some(cmd) => capture::Source::Command { cmd, rate },
+        None => capture::Source::Native,
+    };
+    Ok((host, remote, source))
 }
 
 fn parse_bridge(args: Vec<String>) -> Result<bridge::Options, String> {
