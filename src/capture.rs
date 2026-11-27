@@ -1,0 +1,273 @@
+//! 接続元でのマイク取得。
+//!
+//! 録音セッションごとに取得用のスレッドを 1 本立て、止めるときはそのスレッドごと終わらせる。
+//! 待機中はデバイスを開かないので、OS のマイク使用中表示も消える。
+//!
+//! 取得方法は 2 つ:
+//! - native: cpal で既定の入力デバイスを開く（macOS では Core Audio）
+//! - command: 任意のコマンドの stdout を s16le モノラルとして読む（`rec`, `ffmpeg` など）
+
+use crate::protocol::{end_reason, write_msg, Msg};
+use std::io::{self, Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
+
+/// 1 フレームの長さ。短いほど遅延は減るが SSH のパケット数が増える。
+const FRAME_MS: u32 = 20;
+
+pub type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
+
+#[derive(Clone, Debug)]
+pub enum Source {
+    Native,
+    /// `sh -c` で実行するコマンドと、その出力のサンプルレート。
+    Command { cmd: String, rate: u32 },
+}
+
+#[derive(Default)]
+pub struct Stats {
+    pub bytes_sent: AtomicU64,
+    /// 送信が追いつかず捨てたサンプル数（native のみ）。
+    pub dropped_samples: AtomicU64,
+    /// 取得開始の指示から最初の PCM を送るまで (ms)。
+    pub first_audio_ms: AtomicU64,
+}
+
+pub struct Capture {
+    pub session: u32,
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    thread: Option<JoinHandle<()>>,
+    pub stats: Arc<Stats>,
+}
+
+impl Capture {
+    /// 取得を始める。`on_exit` は取得スレッドが自分から終わったとき（エラーなど）に呼ばれる。
+    pub fn start(
+        source: &Source,
+        session: u32,
+        writer: Writer,
+        on_exit: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) -> Capture {
+        let stop = Arc::new(AtomicBool::new(false));
+        let child = Arc::new(Mutex::new(None));
+        let stats = Arc::new(Stats::default());
+        let ctx = Ctx {
+            session,
+            writer,
+            stop: stop.clone(),
+            child: child.clone(),
+            stats: stats.clone(),
+            began: Instant::now(),
+        };
+        let source = source.clone();
+        let thread = thread::spawn(move || {
+            let result = match &source {
+                Source::Native => run_native(&ctx),
+                Source::Command { cmd, rate } => run_command(&ctx, cmd, *rate),
+            };
+            let stopped = ctx.stop.load(Ordering::SeqCst);
+            let reason = match (&result, stopped) {
+                (_, true) | (Ok(()), _) => end_reason::STOPPED,
+                (Err(_), false) => end_reason::CAPTURE_ERROR,
+            };
+            let _ = ctx.send(&Msg::AudioEnd { session: ctx.session, reason });
+            if !stopped {
+                on_exit(result);
+            }
+        });
+        Capture { session, stop, child, thread: Some(thread), stats }
+    }
+
+    /// 取得を止め、デバイスが閉じるまで待つ。
+    pub fn stop(mut self) -> Arc<Stats> {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(mut c) = self.child.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        self.stats.clone()
+    }
+}
+
+struct Ctx {
+    session: u32,
+    writer: Writer,
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    stats: Arc<Stats>,
+    began: Instant,
+}
+
+impl Ctx {
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn send(&self, msg: &Msg) -> io::Result<()> {
+        write_msg(&mut *self.writer.lock().unwrap(), msg)
+    }
+
+    fn send_pcm(&self, samples: &[i16]) -> Result<(), String> {
+        let mut pcm = Vec::with_capacity(samples.len() * 2);
+        for s in samples {
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+        self.send_bytes(pcm)
+    }
+
+    fn send_bytes(&self, pcm: Vec<u8>) -> Result<(), String> {
+        if self.stats.bytes_sent.load(Ordering::Relaxed) == 0 {
+            self.stats
+                .first_audio_ms
+                .store(self.began.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+        self.stats.bytes_sent.fetch_add(pcm.len() as u64, Ordering::Relaxed);
+        self.send(&Msg::Audio { session: self.session, pcm }).map_err(|e| format!("送信に失敗: {e}"))
+    }
+}
+
+fn run_command(ctx: &Ctx, cmd: &str, rate: u32) -> Result<(), String> {
+    let mut child = Command::new("sh")
+        .args(["-c", cmd])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("取得コマンドを起動できません: {e}"))?;
+    let mut out = child.stdout.take().expect("piped stdout");
+    *ctx.child.lock().unwrap() = Some(child);
+    if ctx.stopped() {
+        // 起動と停止が行き違った場合。stop() が child を見る前だったかもしれないので自分で片付ける
+        if let Some(mut c) = ctx.child.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        return Ok(());
+    }
+
+    ctx.send(&Msg::AudioBegin { session: ctx.session, rate, channels: 1 })
+        .map_err(|e| format!("送信に失敗: {e}"))?;
+    let frame_bytes = (rate * FRAME_MS / 1000) as usize * 2;
+    let mut buf = vec![0u8; frame_bytes];
+    let mut filled = 0;
+    while !ctx.stopped() {
+        match out.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("取得コマンドの出力を読めません: {e}")),
+        }
+        if filled == frame_bytes {
+            ctx.send_bytes(buf.clone())?;
+            filled = 0;
+        }
+    }
+    let status = ctx.child.lock().unwrap().take().map(|mut c| c.wait());
+    if ctx.stopped() {
+        return Ok(());
+    }
+    match status {
+        Some(Ok(s)) if s.success() => Ok(()),
+        Some(Ok(s)) => Err(format!("取得コマンドが終了しました ({s})")),
+        _ => Err("取得コマンドが終了しました".into()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", feature = "native")))]
+fn run_native(_ctx: &Ctx) -> Result<(), String> {
+    Err("このビルドには内蔵のマイク取得が入っていません。--capture-cmd を指定するか、--features native でビルドしてください".into())
+}
+
+#[cfg(any(target_os = "macos", feature = "native"))]
+fn run_native(ctx: &Ctx) -> Result<(), String> {
+    use crate::resample::Decimator;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
+    use std::time::Duration;
+
+    /// コールバックから送信側へ渡す。コールバック内では通信もロック待ちもしない。
+    fn build<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        tx: SyncSender<Vec<i16>>,
+        stats: Arc<Stats>,
+    ) -> Result<cpal::Stream, cpal::BuildStreamError>
+    where
+        T: cpal::SizedSample,
+        f32: cpal::FromSample<T>,
+    {
+        let channels = config.channels.max(1) as usize;
+        device.build_input_stream(
+            config,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                // モノラルへ混ぜて s16 にする
+                let mono: Vec<i16> = data
+                    .chunks(channels)
+                    .map(|frame| {
+                        let sum: f32 =
+                            frame.iter().map(|&s| <f32 as cpal::Sample>::from_sample(s)).sum();
+                        (sum / frame.len() as f32 * 32767.0).clamp(-32768.0, 32767.0) as i16
+                    })
+                    .collect();
+                let n = mono.len() as u64;
+                if let Err(TrySendError::Full(_)) = tx.try_send(mono) {
+                    stats.dropped_samples.fetch_add(n, Ordering::Relaxed);
+                }
+            },
+            |e| eprintln!("micmux: 入力ストリームのエラー: {e}"),
+            None,
+        )
+    }
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or("入力デバイスがありません（マイクのアクセス権限も確認してください）")?;
+    let supported = device
+        .default_input_config()
+        .map_err(|e| format!("入力デバイスの設定を取得できません: {e}"))?;
+    let in_rate = supported.sample_rate().0;
+    let config: cpal::StreamConfig = supported.config();
+
+    // 約 1.3 秒ぶん溜まったら古い順ではなく新しい方を捨てる（数は記録する）
+    let (tx, rx) = sync_channel::<Vec<i16>>(64);
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => build::<f32>(&device, &config, tx, ctx.stats.clone()),
+        cpal::SampleFormat::I16 => build::<i16>(&device, &config, tx, ctx.stats.clone()),
+        cpal::SampleFormat::U16 => build::<u16>(&device, &config, tx, ctx.stats.clone()),
+        cpal::SampleFormat::I32 => build::<i32>(&device, &config, tx, ctx.stats.clone()),
+        other => return Err(format!("未対応のサンプル形式です: {other:?}")),
+    }
+    .map_err(|e| format!("入力ストリームを開けません: {e}"))?;
+    stream.play().map_err(|e| format!("入力ストリームを開始できません: {e}"))?;
+
+    let mut decimator = Decimator::for_rate(in_rate);
+    let out_rate = decimator.out_rate(in_rate);
+    ctx.send(&Msg::AudioBegin { session: ctx.session, rate: out_rate, channels: 1 })
+        .map_err(|e| format!("送信に失敗: {e}"))?;
+
+    let frame = (out_rate * FRAME_MS / 1000) as usize;
+    let mut pending: Vec<i16> = Vec::with_capacity(frame * 4);
+    while !ctx.stopped() {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => {
+                decimator.process(&chunk, &mut pending);
+                while pending.len() >= frame {
+                    ctx.send_pcm(&pending[..frame])?;
+                    pending.drain(..frame);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err("入力ストリームが終了しました".into()),
+        }
+    }
+    drop(stream); // ここでデバイスが閉じる
+    Ok(())
+}

@@ -1,0 +1,23 @@
+[package]
+name = "micmux"
+version = "0.1.0"
+edition = "2021"
+description = "On-demand microphone forwarding over SSH, independent of terminals and applications"
+license = "MIT"
+
+[features]
+# macOS では常に有効。Linux をクライアントにする場合は `--features native` で有効化する
+# （libasound2-dev が必要）。無効でも `--capture-cmd` による取得は使える。
+native = ["dep:cpal"]
+
+[dependencies]
+cpal = { version = "0.15", optional = true }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
