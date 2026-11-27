@@ -14,13 +14,14 @@
 use crate::capture::{Capture, Source, Writer};
 use crate::control::{self, Cmd};
 use crate::protocol::{self, end_reason, write_msg, Msg, VERSION};
+use crate::sanitize::{self, RateLimit};
 use crate::ssh;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -94,37 +95,77 @@ fn detach(log: &Path) -> Result<bool, String> {
     if std::env::var_os(DETACHED_ENV).is_some() {
         return Ok(true);
     }
-    if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    let open = || {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-            .map_err(|e| format!("{}: {e}", log.display()))
-    };
+    let file = open_log(log)?;
     let exe = std::env::current_exe().map_err(|e| format!("自分の実行ファイルの場所がわかりません: {e}"))?;
     let mut cmd = Command::new(exe);
     cmd.args(std::env::args_os().skip(1))
         .env(DETACHED_ENV, "1")
         .stdin(Stdio::null())
-        .stdout(open()?)
-        .stderr(open()?);
+        .stdout(file.try_clone().map_err(|e| format!("{}: {e}", log.display()))?)
+        .stderr(file);
     in_new_session(&mut cmd).spawn().map_err(|e| format!("裏での起動に失敗しました: {e}"))?;
     Ok(false)
 }
 
-pub fn default_log_path() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into())).join(".local/state")
-    });
-    base.join("micmux").join("client.log")
+/// 裏で動くときのログの場所。XDG_STATE_HOME も HOME も無ければ決められない。
+///
+/// /tmp には置かない。誰でも書ける場所では、別の利用者が先にディレクトリや symlink を
+/// 用意しておき、こちらのログを読んだり、別のファイルへ書き込ませたりできてしまう。
+pub fn default_log_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("micmux").join("client.log"))
 }
 
+/// これを超えたログは、起動時に 1 世代だけ退避する。
+const LOG_ROTATE_BYTES: u64 = 1024 * 1024;
+
+/// 裏で動くときのログを開く。録音の時刻や接続先が書かれるので、本人だけが読めるようにする。
+fn open_log(log: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let err = |p: &Path, e: io::Error| format!("{}: {e}", p.display());
+    if let Some(dir) = log.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| err(dir, e))?;
+        // 古い版が 0755 で作ったものも閉じる。symlink の先は変えない
+        if std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    // 際限なく増えないよう、大きくなっていたら 1 世代だけ残して作り直す
+    if std::fs::symlink_metadata(log).is_ok_and(|m| m.is_file() && m.len() > LOG_ROTATE_BYTES) {
+        let mut old = log.as_os_str().to_owned();
+        old.push(".1");
+        std::fs::rename(log, &old).map_err(|e| err(log, e))?;
+        let _ = std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600));
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(log)
+        .map_err(|e| err(log, e))?;
+    // 古い版が 0644 で作ったログも、本人だけが読めるようにする
+    file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|e| err(log, e))?;
+    Ok(file)
+}
+
+/// 1 分あたりに出すログの行数。接続先が録音要求を連打するなどしても、ログが際限なく増えないように。
+static SAY_LIMIT: Mutex<RateLimit> = Mutex::new(RateLimit::new(60, Duration::from_secs(60)));
+
 /// 時刻つきでログに出す。裏で動いているときは stderr がログファイルになる。
+///
+/// 書き込みの失敗は無視する（`eprintln!` はディスクが一杯のときなどに panic する）。
 fn say(text: &str) {
-    eprintln!("{} micmux: {text}", clock());
+    let (ok, dropped) = SAY_LIMIT.lock().map_or((true, 0), |mut l| l.allow(Instant::now()));
+    let mut err = io::stderr().lock();
+    if dropped > 0 {
+        let _ = writeln!(err, "{} micmux: ログが多すぎるので {dropped} 行を省きました", clock());
+    }
+    if ok {
+        let _ = writeln!(err, "{} micmux: {text}", clock());
+    }
 }
 
 /// ログ用の現地時刻 (HH:MM:SS)。
@@ -137,6 +178,33 @@ fn clock() -> String {
     }
 }
 
+/// 接続コマンド（ssh と、その先の bridge）の stderr を、制御文字を落とし量を制限してから
+/// 自分の stderr へ流す。接続先の出力をそのまま通すと、端末の制御シーケンスを流し込まれたり、
+/// 裏で動くときのログでディスクを使い尽くされたりする。
+///
+/// ssh 自身のメッセージ（認証の失敗など）もここを通る。パスフレーズや host key の確認は
+/// ssh が端末 (/dev/tty) に直接尋ねるので、ここを通らない。
+fn relay_stderr(mut from: impl Read + Send + 'static) {
+    thread::spawn(move || {
+        let mut relay = sanitize::Relay::default();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match from.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            };
+            let text = relay.feed(&buf[..n], Instant::now());
+            if !text.is_empty() {
+                let mut err = io::stderr().lock();
+                let _ = err.write_all(text.as_bytes());
+                let _ = err.flush();
+            }
+        }
+    });
+}
+
 /// bridge まで繋ぐ子プロセス。どの経路で抜けても drop で止める。
 struct Transport(Child);
 
@@ -146,6 +214,40 @@ impl Drop for Transport {
         let _ = self.0.wait();
     }
 }
+
+/// bridge から届いて、main がまだ受け取っていないメッセージの数の上限。
+///
+/// 読み取りスレッドが無制限に溜めると、接続先がメッセージを送り続けるだけで接続元のメモリを
+/// 使い尽くせる。channel 自体は上限なしのままにして、bridge からの分だけをここで数える。
+/// channel ごと有界にすると、操作用ソケットや取得スレッドからの送信まで止まりうる
+/// （取得スレッドの終了通知が止まると、その終了を join で待つ main と互いに待ち合う）。
+const MAX_INFLIGHT: usize = 64;
+
+#[derive(Default)]
+struct Inflight {
+    count: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl Inflight {
+    /// 空きができるまで待ってから 1 つ確保する。
+    fn acquire(&self) {
+        let mut n = self.count.lock().unwrap();
+        while *n >= MAX_INFLIGHT {
+            n = self.freed.wait(n).unwrap();
+        }
+        *n += 1;
+    }
+
+    fn release(&self) {
+        let mut n = self.count.lock().unwrap();
+        *n = n.saturating_sub(1);
+        self.freed.notify_one();
+    }
+}
+
+/// 相乗りしてくる ssh の登録数の上限。
+const MAX_WATCHED: usize = 64;
 
 /// 終了の指示を受けた、または監視対象がいなくなった（どちらも正常終了）。
 struct Done;
@@ -168,6 +270,9 @@ struct Client {
     /// 生きているあいだ動き続ける対象。すべて居なくなったら終了する。
     /// 自分の --watch-pid と、相乗りしてきた ssh。--watch-pid 無しで起動した場合は空のまま。
     watched: Vec<i32>,
+    /// 連続録音時間の上限。None なら上限なし。
+    max: Option<Duration>,
+    inflight: Arc<Inflight>,
 }
 
 impl Client {
@@ -176,6 +281,9 @@ impl Client {
     }
 
     fn begin(&mut self, session: u32) {
+        // 録音中に届いた START で取得を始め直しても、連続録音時間は数え直さない。
+        // 数え直すと、接続先が START を送り続けるだけで上限をすり抜けられる
+        let since = self.capture.as_ref().map(|c| c.1);
         self.end("切り替え");
         self.generation += 1;
         let generation = self.generation;
@@ -183,7 +291,7 @@ impl Client {
         let capture = Capture::start(&self.opts.source, session, self.writer.clone(), move |r| {
             let _ = tx.send(Event::CaptureExit(generation, r));
         });
-        self.capture = Some((capture, Instant::now(), generation));
+        self.capture = Some((capture, since.unwrap_or_else(Instant::now), generation));
         self.sessions += 1;
         say(&format!("● 録音中 → {} (session {session})", self.opts.host));
     }
@@ -299,10 +407,14 @@ impl Client {
         } else {
             // --watch-pid 無しで起動された（端末から手で動かしている）なら、終了の条件にしない。
             // 相乗りしてきた ssh が終わっただけで、手で起動したものまで終わってしまわないように
-            if self.opts.watch_pid.is_some() && !self.watched.contains(&pid) {
+            if self.opts.watch_pid.is_none() || self.watched.contains(&pid) {
+                "ok".into()
+            } else if self.watched.len() >= MAX_WATCHED {
+                format!("error: 監視対象が多すぎます（{MAX_WATCHED} 件まで）")
+            } else {
                 self.watched.push(pid);
+                "ok".into()
             }
-            "ok".into()
         };
         let _ = reply.send(text);
     }
@@ -316,6 +428,9 @@ impl Client {
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return Err(Done),
         };
+        if let Some(Event::Msg(_)) = ev {
+            self.inflight.release();
+        }
         let rest = match ev {
             Some(Event::Control(cmd, reply)) => {
                 if !self.on_control(cmd, reply) {
@@ -375,8 +490,10 @@ impl Client {
             Msg::Ping { nonce } => {
                 let _ = self.send(&Msg::Pong { nonce });
             }
-            Msg::Error { message } => say(&format!("bridge のエラー: {message}")),
-            other => say(&format!("想定外のメッセージ: {other:?}")),
+            Msg::Error { message } => {
+                say(&format!("bridge のエラー: {}", sanitize::line(&message, sanitize::MAX_LINE_CHARS)))
+            }
+            other => say(&format!("想定外のメッセージ: {}", other.summary())),
         }
     }
 }
@@ -390,7 +507,9 @@ pub fn run(opts: Options) -> Result<(), String> {
         return control::join_running_instance(&opts);
     }
     if opts.background {
-        let log = opts.log_path.clone().unwrap_or_else(default_log_path);
+        let log = opts.log_path.clone().or_else(default_log_path).ok_or(
+            "ログの置き場所が決められません（XDG_STATE_HOME も HOME もありません）。--log で指定してください",
+        )?;
         if !detach(&log)? {
             return Ok(());
         }
@@ -433,6 +552,8 @@ pub fn run(opts: Options) -> Result<(), String> {
         rtt_ms: None,
         sessions: 0,
         watched,
+        max,
+        inflight: Arc::default(),
     };
 
     if client.opts.mux && client.opts.transport.is_none() {
@@ -459,10 +580,17 @@ pub fn run(opts: Options) -> Result<(), String> {
     let mut from_bridge = child.0.stdout.take().expect("piped stdout");
     {
         let tx = client.tx.clone();
+        let inflight = client.inflight.clone();
         thread::spawn(move || {
-            let closed = protocol::forward(&mut from_bridge, |m| tx.send(Event::Msg(m)).is_ok());
+            let closed = protocol::forward(&mut from_bridge, |m| {
+                inflight.acquire();
+                tx.send(Event::Msg(m)).is_ok()
+            });
             let _ = tx.send(Event::Closed(closed));
         });
+    }
+    if let Some(stderr) = child.0.stderr.take() {
+        relay_stderr(stderr);
     }
 
     // ここから先で抜けると、child の drop で接続コマンドを止める
@@ -477,11 +605,15 @@ pub fn run(opts: Options) -> Result<(), String> {
             return Err(format!("bridge から {} 秒待っても応答がありません", limit.as_secs()));
         }
         match client.next(&rx, Duration::from_millis(500)) {
-            Ok(Some(Event::Msg(Msg::HelloAck { version, source }))) if version == VERSION => break source,
+            Ok(Some(Event::Msg(Msg::HelloAck { version, source }))) if version == VERSION => {
+                break sanitize::line(&source, sanitize::MAX_LINE_CHARS);
+            }
             Ok(Some(Event::Msg(Msg::HelloAck { version, .. }))) => {
                 return Err(format!("プロトコルのバージョンが違います (bridge {version}, client {VERSION})"));
             }
-            Ok(Some(Event::Msg(Msg::Error { message }))) => return Err(format!("bridge: {message}")),
+            Ok(Some(Event::Msg(Msg::Error { message }))) => {
+                return Err(format!("bridge: {}", sanitize::line(&message, sanitize::MAX_LINE_CHARS)));
+            }
             Ok(Some(Event::Closed(e))) => {
                 let detail = e.map(|e| format!(": {e}")).unwrap_or_default();
                 return Err(format!(
@@ -542,12 +674,16 @@ pub fn run(opts: Options) -> Result<(), String> {
             _ => {}
         }
 
-        // 連続録音時間の上限
-        // 打ち切ったあとは、同じ要求が続いていても自動では再開しない
-        if let Some((_, since, _)) = &client.capture {
-            if max.is_some_and(|max| since.elapsed() >= max) {
+        // 連続録音時間の上限。打ち切ったら disarm する。
+        // armed のままにすると、接続先が START を送り直すだけで録音が再開してしまう
+        if let (Some((_, since, _)), Some(max)) = (&client.capture, client.max) {
+            if since.elapsed() >= max {
+                client.armed = false;
                 client.end("時間上限");
-                say("連続録音時間の上限に達しました。続けるには `micmux arm`");
+                say(&format!(
+                    "連続録音時間の上限 ({} 秒) に達したので disarm しました。続けるには `micmux arm`",
+                    max.as_secs()
+                ));
             }
         }
         if Instant::now() >= next_ping {

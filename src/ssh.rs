@@ -105,7 +105,8 @@ pub fn spawn_transport(opts: &Options) -> io::Result<Child> {
             c
         }
     };
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+    // stderr は接続先の出力を含むので、そのまま端末やログへは通さない（client の relay_stderr を通す）
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
 }
 
 #[cfg(test)]

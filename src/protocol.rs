@@ -124,6 +124,23 @@ impl Msg {
         out
     }
 
+    /// ログ用の短い説明。種類と長さだけで、中身（接続先が決める文字列や音声）は含めない。
+    pub fn summary(&self) -> String {
+        let name = match self {
+            Msg::Hello { .. } => "Hello",
+            Msg::HelloAck { .. } => "HelloAck",
+            Msg::Start { .. } => "Start",
+            Msg::Stop { .. } => "Stop",
+            Msg::AudioBegin { .. } => "AudioBegin",
+            Msg::Audio { .. } => "Audio",
+            Msg::AudioEnd { .. } => "AudioEnd",
+            Msg::Ping { .. } => "Ping",
+            Msg::Pong { .. } => "Pong",
+            Msg::Error { .. } => "Error",
+        };
+        format!("{name} ({} バイト)", self.encode().len() - 5)
+    }
+
     fn decode(ty: u8, p: &[u8]) -> io::Result<Msg> {
         let u32_at = |i: usize| -> io::Result<u32> {
             p.get(i..i + 4)
@@ -250,6 +267,14 @@ mod tests {
             assert_eq!(read_msg(&mut r).unwrap().as_ref(), Some(m));
         }
         assert_eq!(read_msg(&mut r).unwrap(), None);
+    }
+
+    #[test]
+    fn summary_omits_contents() {
+        let m = Msg::Audio { session: 1, pcm: vec![0xAB; 60_000] };
+        assert_eq!(m.summary(), "Audio (60004 バイト)");
+        let e = Msg::Error { message: "\x1b]0;x\x07".into() };
+        assert_eq!(e.summary(), "Error (6 バイト)");
     }
 
     #[test]

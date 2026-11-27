@@ -8,6 +8,7 @@ mod control;
 mod debug;
 mod protocol;
 mod resample;
+mod sanitize;
 mod ssh;
 
 use std::process::{Command, ExitCode};
@@ -136,7 +137,13 @@ fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
             "--set-default" => opts.bridge_args.push(a),
             "--background" => opts.background = true,
             "--mux" => opts.mux = true,
-            "--watch-pid" => opts.watch_pid = Some(it.number(&a)?),
+            "--watch-pid" => {
+                let pid = it.number(&a)?;
+                if !control::valid_watch_pid(pid) {
+                    return Err(format!("--watch-pid には 2 以上の pid を指定してください: {pid}"));
+                }
+                opts.watch_pid = Some(pid);
+            }
             "--log" => opts.log_path = Some(it.value(&a)?.into()),
             _ if a.starts_with('-') => return Err(format!("不明なオプション: {a}")),
             _ if host.is_none() => host = Some(a),

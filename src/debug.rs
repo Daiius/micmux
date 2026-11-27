@@ -3,7 +3,7 @@
 //! 何も変更しない。マイクは合計で数秒だけ開く。
 
 use crate::capture::{self, Source};
-use crate::{client, control, ssh};
+use crate::{client, control, sanitize, ssh};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -27,10 +27,10 @@ fn capture_output(cmd: &mut Command) -> String {
 }
 
 /// 字下げして出す。関係のない長いコマンドラインで埋もれないよう、1 行は 200 文字まで。
+/// ログの末尾や接続先の出力には接続先由来の文字列が入るので、制御文字を落としてから出す。
 fn indent(text: &str) {
     for line in text.lines() {
-        let short: String = line.chars().take(200).collect();
-        println!("  {short}");
+        println!("  {}", sanitize::line(line, 200));
     }
 }
 
@@ -68,14 +68,20 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
     indent(&capture_output(Command::new("sh").args(["-c", "ps -axo pid,ppid,lstart,command | grep '[m]icmux' || echo '(micmux のプロセスは無い)'"])));
 
     section("裏で動かしたときのログ (末尾 40 行)");
-    let log = client::default_log_path();
-    println!("  {}", log.display());
-    match std::fs::read_to_string(&log) {
-        Ok(text) => {
-            let lines: Vec<&str> = text.lines().collect();
-            indent(&lines[lines.len().saturating_sub(40)..].join("\n"));
+    match client::default_log_path() {
+        Some(log) => {
+            println!("  {}", log.display());
+            // 不正な UTF-8 が混ざっていても読めるようにする
+            match std::fs::read(&log) {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let lines: Vec<&str> = text.lines().collect();
+                    indent(&lines[lines.len().saturating_sub(40)..].join("\n"));
+                }
+                Err(e) => println!("  (読めません: {e})"),
+            }
         }
-        Err(e) => println!("  (読めません: {e})"),
+        None => println!("  (XDG_STATE_HOME も HOME も無いので場所が決まりません)"),
     }
 
     if let Some(host) = &host {

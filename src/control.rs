@@ -176,26 +176,39 @@ pub fn listen(tx: Sender<Event>) -> Result<SocketFile, String> {
             let (rtx, rrx) = sync_channel(1);
             let mut words = line.split_whitespace();
             let event = match (words.next(), words.next().and_then(|p| p.parse().ok()), words.next()) {
+                (Some("watch"), Some(pid), Some(_)) if !valid_watch_pid(pid) => {
+                    Err(format!("error: pid {pid} は監視できません"))
+                }
                 (Some("watch"), Some(pid), Some(host)) => {
-                    Some(Event::Watch { pid, host: host.to_string(), reply: rtx })
+                    Ok(Event::Watch { pid, host: host.to_string(), reply: rtx })
                 }
                 // 空行での toggle は端末からの操作専用
-                _ if line.trim().is_empty() => None,
-                _ => Cmd::parse(&line).map(|cmd| Event::Control(cmd, Some(rtx))),
+                _ if line.trim().is_empty() => Err("error: unknown command".into()),
+                _ => Cmd::parse(&line)
+                    .map(|cmd| Event::Control(cmd, Some(rtx)))
+                    .ok_or_else(|| "error: unknown command".into()),
             };
             let reply = match event {
-                Some(ev) => {
+                Ok(ev) => {
                     if tx.send(ev).is_err() {
                         return;
                     }
                     rrx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| "timeout".into())
                 }
-                None => "error: unknown command".into(),
+                Err(e) => e,
             };
             let _ = writeln!(conn, "{reply}");
         }
     });
     Ok(SocketFile { path, id })
+}
+
+/// 生きているあいだ動き続ける対象として受け付ける pid か。
+///
+/// 0 と負の値は kill(2) ではプロセスグループや全プロセスを指し、存在確認が常に成功してしまう。
+/// 1 (init / launchd) は終わらない。どれを登録しても micmux が終わらなくなるので断る。
+pub fn valid_watch_pid(pid: i32) -> bool {
+    pid > 1
 }
 
 /// 動いている micmux に、この ssh が生きているあいだも動き続けるよう登録する。
@@ -231,6 +244,15 @@ pub fn join_when_ready(opts: &Options) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_pid_must_be_above_one() {
+        for pid in [i32::MIN, -1, 0, 1] {
+            assert!(!valid_watch_pid(pid), "{pid}");
+        }
+        assert!(valid_watch_pid(2));
+        assert!(valid_watch_pid(i32::MAX));
+    }
 
     #[test]
     fn login_name_matches_user() {

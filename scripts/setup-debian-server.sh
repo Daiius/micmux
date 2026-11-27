@@ -73,7 +73,7 @@ case "$MODE" in
     if [ "${#todo[@]}" -gt 0 ]; then
       echo "これから入れるパッケージ: ${todo[*]}"
       confirm "sudo apt-get install を実行しますか?" || { echo "中止しました"; exit 1; }
-      sudo apt-get install -y --no-install-recommends "${todo[@]}"
+      sudo apt-get install -y --no-install-recommends -- "${todo[@]}"
       mkdir -p "$(dirname "$STATE_FILE")"
       printf '%s\n' "${todo[@]}" >> "$STATE_FILE"
       sort -u -o "$STATE_FILE" "$STATE_FILE"
@@ -95,11 +95,22 @@ case "$MODE" in
       echo "このスクリプトが入れたパッケージの記録がありません ($STATE_FILE)"
       exit 0
     fi
-    mapfile -t todo < "$STATE_FILE"
+    # 記録の各行は sudo apt-get の引数になる。書き換えられていても、このスクリプトが入れうる
+    # パッケージ名以外（たとえば -o で始まる apt のオプション）は通さない
+    todo=()
+    while IFS= read -r line; do
+      for p in "${PACKAGES[@]}"; do
+        if [ "$line" = "$p" ]; then todo+=("$p"); fi
+      done
+    done < "$STATE_FILE"
+    if [ "${#todo[@]}" -eq 0 ]; then
+      echo "記録 ($STATE_FILE) に、このスクリプトが入れるパッケージがありません"
+      exit 0
+    fi
     echo "このスクリプトが入れたパッケージ: ${todo[*]}"
     # apt-get remove はこれらに依存するパッケージも一緒に消す。記録だけを見せて確認すると、
     # 利用者の知らないものまで消えるので、実際に消えるものを模擬実行で調べて見せる
-    removing="$(apt-get -s remove "${todo[@]}" | awk '$1 == "Remv" { print $2 }')"
+    removing="$(apt-get -s remove -- "${todo[@]}" | awk '$1 == "Remv" { print $2 }')"
     if [ -z "$removing" ]; then
       echo "取り除くものはありません（既に入っていない）"
       rm -f "$STATE_FILE"
@@ -109,7 +120,7 @@ case "$MODE" in
     printf '%s\n' "$removing" | sed 's/^/  /'
     confirm "sudo apt-get remove を実行しますか?" || { echo "中止しました"; exit 1; }
     systemctl --user disable --now pulseaudio.socket pulseaudio.service 2>/dev/null || true
-    sudo apt-get remove -y "${todo[@]}"
+    sudo apt-get remove -y -- "${todo[@]}"
     rm -f "$STATE_FILE"
     echo "取り除きました。依存で入ったライブラリは sudo apt-get autoremove で消せます。"
     ;;
