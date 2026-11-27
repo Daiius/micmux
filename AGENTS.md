@@ -40,9 +40,9 @@ cargo clippy --locked --all-targets -- -D warnings
 - 対応する Rust は **1.89 以降**（`Cargo.toml` の `rust-version`）。それより新しい版でしか使えない機能は
   使わない。CI の `msrv` ジョブが確かめる。
 - lint の警告は 0 件を保つ（CI は `-D warnings`）。
-- `cfg(target_os = "macos")` の分岐は、Linux ではビルドできない。**CI の `macos` ジョブが、ビルドと
-  単体テストを確かめる。** 実際のマイクでの録音・マイクの許可・`~/.ssh/config` との連動は CI では
-  試せないので、そこに関わる変更は、その旨を報告して実機で確かめてもらう。
+- `cfg(target_os = "macos")` の分岐は、Linux ではビルドできず、**CI でも確かめていない**。
+  触ったら、その旨を報告し、macOS の実機でビルドして確かめてもらう。
+- 音声の流れに関わる変更は、通しの試験を手元で回す（下の「通しの試験」）。
 - cpal を使う側のコードは、Linux でも `--features native` でビルドして型を確かめられる
   （`libasound2-dev` が要る）。
 
@@ -76,6 +76,21 @@ DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent pulseaudio -n \
 - 起動したら、`pactl info` の `Server String` が `$S` の下を指していることを確かめてから使う。
 - 終わったら `kill $PA` で止める。
 
+### 通しの試験
+
+```sh
+cargo build --release
+./scripts/e2e-linux.sh target/release/micmux
+```
+
+代役のマイク（音を流し込んだ null sink）から client が取得し、bridge を通って仮想マイクに届いた音を
+録って照合する。armed での転送、disarmed での拒否、arm のし直し、client が突然終わったときの後片付けを見る。
+専用の音声サーバーを一時ディレクトリに立てるので、実運用のものには触れない。CI の `e2e` ジョブも
+同じスクリプトを回す。
+
+`--features native` でビルドしたバイナリに `E2E_NATIVE=1` を付けると、内蔵の取得
+（cpal → ALSA → PulseAudio）を通す。接続元を Linux にする場合の経路である。
+
 ### client と bridge を 1 台の中でつなぐ
 
 ```sh
@@ -94,7 +109,7 @@ micmux connect --transport "/path/to/micmux bridge --sink-name mmtest" --capture
 
 | workflow | 内容 |
 |---|---|
-| `ci` | ビルド・テスト・lint を Linux と macOS で回す。`native` feature の lint と、`rust-version` の版でのビルド（`msrv`）も確かめる |
+| `ci` | ビルド・テスト・lint、`native` feature の lint、`rust-version` の版でのビルド（`msrv`）、音声の通しの試験（`e2e`）。すべて Linux。文書だけの変更では回らない |
 | `audit` | 依存関係を、既知の脆弱性と照合する（`cargo audit`）。依存を変えた PR と、週に 1 回 |
 | `secret-scan` | 全 ref の全履歴を、Betterleaks で秘密の検査にかける |
 
