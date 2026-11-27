@@ -31,16 +31,18 @@ SSH 接続元のマイクを、接続先の仮想マイクとして使えるよ�
 ## ビルドと確認
 
 ```sh
-cargo build --release
-cargo test
-cargo clippy --all-targets
+cargo build --locked
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
 - 依存 crate は `libc` と `cpal` だけ。増やさない（[prd/02](./prd/02-architecture.md) §1）。
-- 接続元の側のツールチェーンの版が決まっていないので、新しい Rust でしか使えない機能を避ける
-  （[#7](https://github.com/Daiius/micmux/issues/7)）。
-- `cfg(target_os = "macos")` の分岐は、Linux ではビルドできない。触ったら、その旨を報告し、
-  macOS の実機で確かめてもらう。
+- 対応する Rust は **1.89 以降**（`Cargo.toml` の `rust-version`）。それより新しい版でしか使えない機能は
+  使わない。CI の `msrv` ジョブが確かめる。
+- lint の警告は 0 件を保つ（CI は `-D warnings`）。
+- `cfg(target_os = "macos")` の分岐は、Linux ではビルドできない。**CI の `macos` ジョブが、ビルドと
+  単体テストを確かめる。** 実際のマイクでの録音・マイクの許可・`~/.ssh/config` との連動は CI では
+  試せないので、そこに関わる変更は、その旨を報告して実機で確かめてもらう。
 - cpal を使う側のコードは、Linux でも `--features native` でビルドして型を確かめられる
   （`libasound2-dev` が要る）。
 
@@ -88,13 +90,44 @@ micmux connect --transport "/path/to/micmux bridge --sink-name mmtest" --capture
   sshd を立てる。鍵と設定は作業用のディレクトリに置き、利用者の `~/.ssh` には触れない。
   `ControlPath` は長すぎると失敗するので、短い場所にする。
 
+## CI
+
+| workflow | 内容 |
+|---|---|
+| `ci` | ビルド・テスト・lint を Linux と macOS で回す。`native` feature の lint と、`rust-version` の版でのビルド（`msrv`）も確かめる |
+| `audit` | 依存関係を、既知の脆弱性と照合する（`cargo audit`）。依存を変えた PR と、週に 1 回 |
+| `secret-scan` | 全 ref の全履歴を、Betterleaks で秘密の検査にかける |
+
+- workflow の権限は `contents: read` だけにする。
+- 外部の Action は `actions/checkout`（コミットで固定）だけを使う。Rust はランナーの rustup で、
+  Betterleaks と cargo-audit は公式の配布元から直接入れる。非公式の Action に権限を渡さない。
+
+## 秘密の検査（Betterleaks）
+
+公開リポジトリなので、秘密（トークン・`.env*` など）のコミットを、push の前と CI で止める。
+規則は [`.betterleaks.toml`](./.betterleaks.toml)（組み込みの規則 + `.env*` をファイル名で止める規則）。
+**設定は自動では読まれないので、`betterleaks` を直接叩くときは `--config .betterleaks.toml` を付ける。**
+
+- push 前: [`.githooks/pre-push`](./.githooks/pre-push) が、送るコミットだけを検査して止める。
+  **clone したら、一度だけ `./.githooks/install.sh` を実行する**（git 2.55 以降の config ベース hooks）。
+  Betterleaks が無いホストでは、警告して素通りする。
+- CI: `secret-scan` が、範囲を計算せず毎回全履歴を検査する。手元の検査をすり抜けたものを拾う。
+- コミット時の検査は、ホストのグローバルな hook に任せ、リポジトリ側では持たない。
+
 ## 公開リポジトリであること
 
 コード・文書・コミットメッセージ・issue に、秘密情報や、利用者の環境を特定する情報（ホスト名・
 ユーザー名・IP アドレス・実際のパス）を書かない。`micmux debug` の出力は、これらを含む
 （[prd/README.md](./prd/README.md)「公開リポジトリでの秘匿方針」）。
 
-## コミット
+## Git / PR の運用
 
 - コミットメッセージは 3 行程度に収める。背景や設計の判断は PRD に、確かめ方は PR の本文に書く。
 - ステージするときは、パスを明示する。作業ディレクトリにあるものをまとめて拾わない。
+- 変更は PR にする。**レビュー中の PR には、追加のコミットを積む**（amend と force push はしない）。
+- PR は、CI が通り、レビューボット（oculibis）の指摘がゼロになってからマージする。
+  レビューの実行中は push しない。
+- マージは **merge commit**（2026-11-28 に決定）。レビュー指摘への対応などの、コミットごとの履歴を残す。
+- マージは、利用者の了承を得てから行う。
+- レビューボットの設定は [`.github/review-bot.json`](./.github/review-bot.json)。PRD の場所として
+  `prd/`・`AGENTS.md`・`README.md` を宣言している。

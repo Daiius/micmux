@@ -141,5 +141,6 @@ gap: `XDG_RUNTIME_DIR` が無い接続先では、排他用のファイルを `/
 - 中程度の 2 件（上限のすり抜け・ディスクとメモリの消費）と、軽微な 4 件を修正した。
 - 軽微な 3 件は、issue に記録して見送った（[#1](https://github.com/Daiius/micmux/issues/1)・
   [#2](https://github.com/Daiius/micmux/issues/2)・[#3](https://github.com/Daiius/micmux/issues/3)）。
-- 依存関係は、すべて crates.io 由来で検査用の値が付いていることまでを確かめた。**既知の脆弱性との照合は
-  していない**（[#7](https://github.com/Daiius/micmux/issues/7)）。
+- 依存関係は、すべて crates.io 由来で検査用の値が付いていることを確かめた。レビューの時点では
+  既知の脆弱性との照合をしていなかったが、2026-11-28 に `cargo audit` で照合し、112 個に該当は無かった。
+  以後は CI が照合する（[06](./06-operations.md) §6.1）。

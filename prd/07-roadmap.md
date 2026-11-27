@@ -18,6 +18,8 @@
 - **接続先を信頼しない前提の防御**: 届く文字列と量の制限、ログの権限と退避（[05](./05-security.md) §3）。
 - **操作と調査**: `arm`・`disarm`・`toggle`・`status`、`doctor`、`debug`（[06](./06-operations.md)）。
 - **セットアップスクリプト**: Debian の接続先向け（[06](./06-operations.md) §1.1）。
+- **CI と秘密の検査**: Linux・macOS でのビルド・テスト・lint、Rust の最低版でのビルド、依存関係の照合、
+  全履歴の秘密の検査、push 前の検査（[06](./06-operations.md) §6）。
 
 ## 実機での確認の状況
 
@@ -35,6 +37,8 @@
 | スリープ（数分）から復帰したあと、SSH を開き直さずに使える | 確認済み |
 | `micmux arm` / `status`（レビュー対応後の版） | macOS で確認済み |
 | 接続元の異常終了・端末ごとの切断・bridge への SIGTERM で、接続先が元に戻る | Linux の隔離環境で確認済み |
+| macOS 向けの分岐のビルドと単体テスト | CI の macOS のランナーで、変更のたびに確認 |
+| Rust 1.89 でのビルド | CI で、変更のたびに確認 |
 | 接続元が Linux | 同一マシン上でのみ確認。別マシンからの SSH 越しは未確認 |
 | pipewire-pulse の接続先 | **未確認** |
 | 30 分を超えるスリープからの復帰 | **未確認**（bridge が終了しているので、ssh の開き直しが要る想定） |
@@ -95,7 +99,7 @@
 | [#4](https://github.com/Daiius/micmux/issues/4) | `--ssh-arg` の効き方が、接続本体と `--mux` の下調べとで食い違う | 簡素化 |
 | [#5](https://github.com/Daiius/micmux/issues/5) | 表示の細かい不整合 | 簡素化 |
 | [#6](https://github.com/Daiius/micmux/issues/6) | 音声が実時間より速く届くと、bridge が録音の終了を検出できなくなる（要調査） | 簡素化の動作確認 |
-| [#7](https://github.com/Daiius/micmux/issues/7) | 対応する Rust の最低版を決め、依存関係を既知の脆弱性と照合する | 簡素化・セキュリティ |
+| [#7](https://github.com/Daiius/micmux/issues/7) | 書式（rustfmt）を統一するかどうか。Rust の最低版と依存関係の照合は対応済み | 簡素化・セキュリティ |
 
 ## 取り下げたもの
 
