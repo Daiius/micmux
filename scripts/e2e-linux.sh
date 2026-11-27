@@ -77,25 +77,14 @@ sink_exists() { pactl list short sinks | cut -f2 | grep -qx "$1"; }
 
 echo "== 専用の音声サーバーを立てる"
 # D-Bus を切り離さないと、利用者の音声サーバーと名前が衝突して起動しない
+# module-always-sink: 実体のある出力先が無いときの代役（auto_null）を置く。ヘッドレスのサーバーと同じ状態にする
 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent pulseaudio -n \
-  -L "module-native-protocol-unix socket=$W/pulse-rt/native" \
+  -L "module-native-protocol-unix socket=$W/pulse-rt/native" -L module-always-sink \
   --daemonize=no --exit-idle-time=-1 --use-pid-file=no --log-target="file:$W/pulse.log" &
 PIDS+=($!)
 wait_for 10 pactl info || fail "音声サーバーが起動しない"
 pactl info | grep -q "$W" || fail "専用の音声サーバーに繋がっていない"
 ok "音声サーバー"
-
-echo "== 代役のマイクに 1 kHz の音を流し続ける"
-pactl load-module module-null-sink sink_name=fakemic rate=48000 channels=1 format=s16le >/dev/null
-python3 - "$W/tone.raw" <<'PY'
-import struct, sys, math
-# 1 秒ぶん。1 kHz は 48 kHz でちょうど 48 サンプル周期なので、つなぎ目で途切れない
-open(sys.argv[1], 'wb').write(b''.join(
-    struct.pack('<h', int(12000 * math.sin(2 * math.pi * 1000 * i / 48000))) for i in range(48000)))
-PY
-( while :; do cat "$W/tone.raw"; done ) \
-  | pacat --playback --device=fakemic --raw --rate=48000 --channels=1 --format=s16le --latency-msec=50 &
-PIDS+=($!)
 
 echo "== client と bridge をつなぐ"
 CAPTURE=(--capture-cmd "parec --device=fakemic.monitor --raw --rate=16000 --channels=1 --format=s16le --latency-msec=20")
@@ -116,6 +105,24 @@ status_has 'armed=true' || fail "armed になっていない"
 wait_for 5 sink_exists e2e || fail "仮想マイクが作られない"
 ok "接続と仮想マイク"
 
+echo "== 仮想マイクが、既定の出力先になっていない"
+[ "$(pactl get-default-sink)" != e2e ] || fail "仮想マイクが既定の出力先になっている"
+ok "既定の出力先は $(pactl get-default-sink)"
+
+echo "== 代役のマイクに 1 kHz の音を流し続ける"
+# bridge より後に作る。先に作ると、これが既定の出力先になってしまい、下の混入の試験にならない
+pactl load-module module-null-sink sink_name=fakemic rate=48000 channels=1 format=s16le >/dev/null
+python3 - "$W/tone.raw" <<'PY'
+import struct, sys, math
+# 1 秒ぶん。1 kHz は 48 kHz でちょうど 48 サンプル周期なので、つなぎ目で途切れない
+open(sys.argv[1], 'wb').write(b''.join(
+    struct.pack('<h', int(12000 * math.sin(2 * math.pi * 1000 * i / 48000))) for i in range(48000)))
+PY
+# cat が失敗したら（pacat が止まった、ファイルが消えた）ループも終わる。while : だと空回りして残る
+( while cat "$W/tone.raw"; do :; done 2>/dev/null ) \
+  | pacat --playback --device=fakemic --raw --rate=48000 --channels=1 --format=s16le --latency-msec=50 &
+PIDS+=($!)
+
 echo "== armed: 仮想マイクから録ると、代役のマイクの音が届く"
 timeout 4 parec --device=e2e.monitor --raw --rate=16000 --channels=1 --format=s16le >"$W/armed.raw" || true
 read -r rms freq < <(analyze "$W/armed.raw")
@@ -127,12 +134,24 @@ wait_for 5 grep -q '録音終了 → STOP' "$W/client.log" || fail "STOP が出�
 wait_for 5 status_has 'recording=false' || fail "録音が止まらない"
 ok "転送と、録音要求の開始・終了"
 
-echo "== disarmed: 録音要求を断り、音は届かない"
+echo "== disarmed: 録音要求を断り、音は届かない。接続先で鳴らした音も混ざらない"
 "$BIN" disarm >/dev/null
+# 出力先を指定せずに鳴らす（＝既定の出力先へ）。仮想マイクが既定になっていると、ここで混ざる
+python3 - "$W/noise.raw" <<'PY'
+import struct, sys, math
+open(sys.argv[1], 'wb').write(b''.join(
+    struct.pack('<h', int(12000 * math.sin(2 * math.pi * 3000 * i / 48000))) for i in range(48000)))
+PY
+( while cat "$W/noise.raw"; do :; done 2>/dev/null ) \
+  | pacat --playback --raw --rate=48000 --channels=1 --format=s16le --latency-msec=50 &
+NOISE=$!
+PIDS+=("$NOISE")
+sleep 0.5
 timeout 2 parec --device=e2e.monitor --raw --rate=16000 --channels=1 --format=s16le >"$W/disarmed.raw" || true
 read -r rms _ < <(analyze "$W/disarmed.raw")
 echo "   rms=$rms"
-[ "$rms" -lt 50 ] || fail "disarmed なのに音が届いた (rms=$rms)"
+kill "$NOISE" 2>/dev/null || true
+[ "$rms" -lt 50 ] || fail "disarmed なのに音が届いた。接続先で鳴らした音が混ざった可能性もある (rms=$rms)"
 grep -q '録音要求を断りました' "$W/client.log" || fail "断った記録が無い"
 ok "disarmed での拒否"
 
@@ -148,8 +167,8 @@ echo "== client が突然終わっても、接続先が元に戻る"
 # SIGTERM で即座に落とす。bridge は標準入力の EOF で気づいて後片付けをする
 kill "$CLIENT"
 wait "$CLIENT" 2>/dev/null || true
-gone() { ! sink_exists e2e; }
-wait_for 5 gone || fail "仮想マイクが残っている"
+gone() { ! sink_exists e2e && ! sink_exists e2e_discard; }
+wait_for 5 gone || fail "仮想マイクか、出力の捨て先が残っている"
 ok "後片付け"
 
 echo "すべて通りました"

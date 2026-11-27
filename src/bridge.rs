@@ -124,6 +124,18 @@ struct VirtualMic {
     module: Option<String>,
     /// 差し替え前の既定 source。終了時に戻す。
     prev_default: Option<String>,
+    /// 出力の捨て先として自分で読み込んだ module（`keep_out_of_default_sink`）。終了時に片付ける。
+    discard_module: Option<String>,
+    /// 捨て先を既定にする前の、既定の出力先。終了時に戻す。
+    prev_default_sink: Option<String>,
+}
+
+/// 実体のある出力先が 1 つも無いときに、音声サーバーが代役として置く sink の名前
+/// （PulseAudio の module-always-sink。pipewire-pulse も同じ名前を使う）。
+const PLACEHOLDER_SINK: &str = "auto_null";
+
+fn default_sink() -> Option<String> {
+    pactl(&["get-default-sink"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 impl VirtualMic {
@@ -136,10 +148,23 @@ impl VirtualMic {
             format!("サウンドサーバーに接続できません。PulseAudio か pipewire-pulse が動いているか確認してください ({e})")
         })?;
         let sink = opts.sink_name.clone();
-        let module = if find_index("sinks", &sink)?.is_some() {
-            log!("micmux bridge: 既存の sink '{sink}' を使います");
-            None
-        } else {
+        let mut mic = VirtualMic {
+            sink: sink.clone(),
+            source_index: 0,
+            module: None,
+            prev_default: None,
+            discard_module: None,
+            prev_default_sink: None,
+        };
+        // 仮想マイクの sink を作る前に確かめる。作った後だと、既に鳴っている音が流れ込んでしまう
+        if matches!(default_sink().as_deref(), None | Some(PLACEHOLDER_SINK)) {
+            mic.keep_out_of_default_sink();
+        }
+        let module = (|| -> Result<Option<String>, String> {
+            if find_index("sinks", &sink)?.is_some() {
+                log!("micmux bridge: 既存の sink '{sink}' を使います");
+                return Ok(None);
+            }
             let id = pactl(&[
                 "load-module",
                 "module-null-sink",
@@ -149,9 +174,19 @@ impl VirtualMic {
                 "format=s16le",
                 &format!("sink_properties=device.description={sink}"),
             ])?;
-            Some(id.trim().to_string())
+            Ok(Some(id.trim().to_string()))
+        })();
+        mic.module = match module {
+            Ok(m) => m,
+            Err(e) => {
+                mic.teardown(); // 先に作った捨て先を残さない
+                return Err(e);
+            }
         };
-        let mut mic = VirtualMic { sink, source_index: 0, module, prev_default: None };
+        // 上の確認をすり抜けた場合の保険（代役の sink の名前が違う音声サーバーなど）
+        if default_sink().as_deref() == Some(mic.sink.as_str()) {
+            mic.keep_out_of_default_sink();
+        }
         match find_index("sources", &mic.source_name()) {
             Ok(Some(i)) => mic.source_index = i,
             other => {
@@ -172,6 +207,42 @@ impl VirtualMic {
         Ok(mic)
     }
 
+    /// 仮想マイクの sink が、既定の出力先にならないようにする。
+    ///
+    /// 仮想マイクは null sink とその monitor でできている。実体のある出力先が無い接続先
+    /// （ヘッドレスのサーバー）では、この sink が唯一の出力先になり、音声サーバーが既定に選ぶ。
+    /// すると、接続先で鳴った音がすべて仮想マイクに流れ込み、マイクの音としてアプリに届く。
+    /// 出力の捨て先を別に用意し、そちらを既定にして防ぐ。
+    fn keep_out_of_default_sink(&mut self) {
+        let discard = format!("{}_discard", self.sink);
+        if self.discard_module.is_none() && !matches!(find_index("sinks", &discard), Ok(Some(_))) {
+            match pactl(&[
+                "load-module",
+                "module-null-sink",
+                &format!("sink_name={discard}"),
+                &format!("sink_properties=device.description={discard}"),
+            ]) {
+                Ok(id) => self.discard_module = Some(id.trim().to_string()),
+                Err(e) => {
+                    log!("micmux bridge: 出力の捨て先を作れません。接続先で鳴った音が仮想マイクに混ざりえます: {e}");
+                    return;
+                }
+            }
+        }
+        let prev = default_sink();
+        match pactl(&["set-default-sink", &discard]) {
+            Ok(_) => {
+                // 代役の sink と自分の sink は、戻す先にしない
+                if self.prev_default_sink.is_none() {
+                    self.prev_default_sink =
+                        prev.filter(|p| p != PLACEHOLDER_SINK && *p != self.sink && *p != discard);
+                }
+                log!("micmux bridge: 既定の出力先を '{discard}' にしました（仮想マイクへの混入を防ぐため）");
+            }
+            Err(e) => log!("micmux bridge: 既定の出力先を変更できません。接続先で鳴った音が仮想マイクに混ざりえます: {e}"),
+        }
+    }
+
     fn active_recorders(&self) -> Result<usize, String> {
         Ok(count_active(&pactl(&["list", "source-outputs"])?, self.source_index))
     }
@@ -183,6 +254,13 @@ impl VirtualMic {
             }
         }
         if let Some(id) = self.module.take() {
+            let _ = pactl(&["unload-module", &id]);
+        }
+        // 仮想マイクを消してから捨て先を消す。逆の順だと、そのあいだ仮想マイクが既定の出力先になる
+        if let Some(prev) = self.prev_default_sink.take() {
+            let _ = pactl(&["set-default-sink", &prev]);
+        }
+        if let Some(id) = self.discard_module.take() {
             let _ = pactl(&["unload-module", &id]);
         }
     }
