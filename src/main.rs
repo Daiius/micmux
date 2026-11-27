@@ -30,6 +30,8 @@ micmux — On-demand microphone forwarding over SSH
       --background            端末から切り離して裏で動く（ログは ~/.local/state/micmux/client.log）
       --watch-pid <pid>       このプロセスが終わったら自分も終わる
       --log <path>            --background のときのログの出力先
+      --mux                   端末用の SSH 接続に相乗りする（認証が 1 回で済む。
+                              ControlMaster / ControlPath / ControlPersist の設定が必要）
   micmux arm | disarm | toggle      動いている connect の録音許可を切り替える
   micmux status [--json]            動いている connect の状態を表示する
   micmux debug [<host>]             不具合調査用に、接続元の状況をまとめて表示する
@@ -111,6 +113,7 @@ fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
         background: false,
         watch_pid: None,
         log_path: None,
+        mux: false,
     };
     let mut capture_cmd = None;
     let mut capture_rate = resample::TARGET_RATE;
@@ -130,6 +133,7 @@ fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
             }
             "--set-default" => opts.bridge_args.push(a),
             "--background" => opts.background = true,
+            "--mux" => opts.mux = true,
             "--watch-pid" => opts.watch_pid = Some(it.number(&a)?),
             "--log" => opts.log_path = Some(it.value(&a)?.into()),
             _ if a.starts_with('-') => return Err(format!("不明なオプション: {a}")),

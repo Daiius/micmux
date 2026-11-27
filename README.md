@@ -28,7 +28,8 @@ SSH 接続元のマイクを、接続先の仮想マイクとして使えるよ�
 | 接続元の異常終了・端末ごとの切断・bridge への SIGTERM で接続先が元に戻る | 実測で確認 |
 | macOS (Core Audio) でのマイク取得 | 実測で確認。Linux (ALSA) でも動作確認 |
 | 実際の SSH 越しの転送と、日本語の文字起こし | 実測で確認 |
-| 裏での起動、複数の SSH の相乗り、SSH 終了への追従 | Linux 上で確認。**`~/.ssh/config` の `LocalCommand` からの起動と macOS では未確認** |
+| `LocalCommand` からの自動起動、裏での動作 | macOS で実測で確認 |
+| `--mux` による接続の相乗り（認証 1 回）、`Match exec` からの起動 | Linux 上の検証用 sshd で確認。**macOS と指紋認証の鍵では未確認** |
 | pipewire-pulse での動作 | 未確認（PulseAudio 17.0 で確認） |
 | Codex CLI | 未確認。0.162.1 の Linux 版バイナリには録音の実装が見当たらない（後述） |
 
@@ -99,6 +100,28 @@ Host dev-server
 - `LocalCommand` は `git` や `scp` がそのホストへ繋ぐときにも走る。その場合 micmux は
   接続が終わるのと同時に終了する。
 
+### 認証を 1 回で済ませる
+
+micmux は端末用とは別の SSH 接続を張るので、そのままでは認証が 2 回要る。
+接続のたびに指紋認証やパスフレーズの入力がある鍵では、`--mux` で端末用の接続に相乗りさせると
+1 回で済む（SSH の多重化を使う）。
+
+```
+Host dev-server
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 1m
+
+Match originalhost dev-server exec "micmux connect %n --mux --background --watch-pid $PPID --set-default"
+```
+
+- `LocalCommand` の代わりに `Match ... exec` で起動する。相乗りした 2 本目以降の SSH では
+  `LocalCommand` が走らないため。上の `LocalCommand` の設定と併用する必要はない。
+- micmux は、端末用の SSH が認証を終えるのを待ってから接続する。
+- `ControlPersist` は必須。最後の SSH を閉じたあとも、指定した時間は接続が保たれる
+  （そのあいだの再接続は認証なしで通る）。
+- 音声と端末の通信が同じ TCP 接続を通る。大量の出力を流している最中は音声が遅れうる。
+
 うまく動かないときは、接続元で次を実行すると状況をまとめて表示する。
 micmux の版、動いているプロセス、ログの末尾、ssh の設定、端末なしでの接続可否、
 マイクから音が取れるか（端末から直接と、切り離した状態の両方）を出す。
@@ -128,6 +151,7 @@ PULSE_SOURCE=micmux.monitor claude
 | `--transport <cmd>` | ssh の代わりに使う接続コマンド |
 | `--background` | 端末から切り離して裏で動く |
 | `--watch-pid <pid>` | 指定したプロセスが終わったら自分も終わる |
+| `--mux` | 端末用の SSH 接続に相乗りする |
 
 内蔵のマイク取得がうまく動かない場合は、SoX で代用できる。
 

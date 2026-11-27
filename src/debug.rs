@@ -86,12 +86,12 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
             "requesttty ", "controlmaster ", "controlpath ", "controlpersist ", "identityagent ",
             "proxyjump ", "proxycommand ", "batchmode ",
         ];
-        let conf = capture_output(Command::new("ssh").args(["-G", host]));
+        let conf = capture_output(Command::new("ssh").env(client::INTERNAL_ENV, "1").args(["-G", host]));
         indent(&conf.lines().filter(|l| keys.iter().any(|k| l.starts_with(k))).collect::<Vec<_>>().join("\n"));
 
         section("端末なしでの接続（裏で動く micmux と同じ条件）");
         let remote = format!("echo \"remote PATH=$PATH\"; {remote_cmd} --version; {remote_cmd} doctor");
-        indent(&capture_output(Command::new("ssh").args([
+        indent(&capture_output(Command::new("ssh").env(client::INTERNAL_ENV, "1").args([
             "-T",
             "-o", "BatchMode=yes",
             "-o", "ControlMaster=no",

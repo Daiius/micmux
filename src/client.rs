@@ -39,6 +39,8 @@ pub struct Options {
     /// このプロセスが生きているあいだだけ動く。裏で動かすときの終了条件。
     pub watch_pid: Option<i32>,
     pub log_path: Option<PathBuf>,
+    /// 端末用の SSH 接続に相乗りする（SSH の多重化）。認証が 1 回で済む。
+    pub mux: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -208,6 +210,91 @@ fn spawn_control_socket(tx: Sender<Event>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// micmux が起動した ssh であることを示す環境変数。
+///
+/// ~/.ssh/config の `Match ... exec` から micmux を起動している場合、micmux 自身の ssh でも
+/// その exec が走る。そこで起動された micmux がこれを見て何もせずに終われば、再帰しない。
+pub const INTERNAL_ENV: &str = "MICMUX_INTERNAL";
+
+fn ssh_command() -> Command {
+    let mut c = Command::new("ssh");
+    c.env(INTERNAL_ENV, "1");
+    c
+}
+
+/// 端末用の SSH がマスターとして立ち上がる（＝利用者が認証を済ませる）のを待つ。
+///
+/// 待たずに接続すると、こちらの ssh が先に認証を始めてしまい、認証が 2 回になる。
+fn wait_for_master(opts: &Options) -> Result<(), String> {
+    let conf = ssh_command()
+        .args(&opts.ssh_args)
+        .args(["-G", &opts.host])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("ssh を実行できません: {e}"))?;
+    let conf = String::from_utf8_lossy(&conf.stdout).into_owned();
+    let value = |key: &str| conf.lines().find_map(|l| l.strip_prefix(key)).map(str::trim).unwrap_or("");
+    if matches!(value("controlpath "), "" | "none") {
+        return Err(format!("--mux には ~/.ssh/config の {} に ControlPath の設定が必要です", opts.host));
+    }
+    if matches!(value("controlpersist "), "" | "no") {
+        // これが無いと、端末用の ssh はログアウト時にこちらの接続が終わるのを待ち、
+        // こちらはその ssh が終わるのを待つので、互いに終われなくなる
+        return Err(format!("--mux には ~/.ssh/config の {} に ControlPersist の設定が必要です", opts.host));
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let up = ssh_command()
+            .args(&opts.ssh_args)
+            .args(["-O", "check", &opts.host])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if up {
+            return Ok(());
+        }
+        if opts.watch_pid.is_some_and(|pid| !alive(pid)) {
+            return Err("端末用の ssh が接続する前に終了しました".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("端末用の SSH 接続が 120 秒待っても確立しませんでした".into());
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// 操作用ソケットのファイルを、どの経路で終わっても消す。
+struct SocketFile(Option<PathBuf>);
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// 動いている micmux に、この ssh が生きているあいだも動き続けるよう登録する。
+fn join_running_instance(opts: &Options) -> Result<(), String> {
+    match opts.watch_pid {
+        Some(pid) => {
+            let reply = send_control(&format!("watch {pid} {}", opts.host))?;
+            if reply == "ok" || opts.background {
+                if reply != "ok" {
+                    eprintln!("micmux: {reply}");
+                }
+                Ok(())
+            } else {
+                Err(reply)
+            }
+        }
+        None => Err(format!("別の micmux connect が動いています ({})", control_path().display())),
+    }
+}
+
 fn spawn_transport(opts: &Options) -> io::Result<Child> {
     let remote = std::iter::once(opts.remote_cmd.as_str())
         .chain(["bridge"])
@@ -221,13 +308,18 @@ fn spawn_transport(opts: &Options) -> io::Result<Child> {
             c
         }
         None => {
-            let mut c = Command::new("ssh");
+            let mut c = ssh_command();
             c.args([
                 "-T", // PTY を割り当てない（バイナリが変換されないように）
                 "-o", "Compression=no",
-                // 端末用の接続と TCP を分ける。既存の多重化接続にも相乗りしない
+                // 自分がマスターになることはない
                 "-o", "ControlMaster=no",
-                "-o", "ControlPath=none",
+            ]);
+            if !opts.mux {
+                // 端末用の接続と TCP を分ける。既存の多重化接続にも相乗りしない
+                c.args(["-o", "ControlPath=none"]);
+            }
+            c.args([
                 "-o", "ServerAliveInterval=10",
                 "-o", "ServerAliveCountMax=3",
                 // ~/.ssh/config の LocalCommand から起動された場合に、自分の接続でまた
@@ -394,22 +486,12 @@ impl Client {
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
+    if std::env::var_os(INTERNAL_ENV).is_some() {
+        return Ok(()); // micmux 自身の ssh から呼ばれた。何もしない
+    }
     if another_instance_running() {
         // 同じホストへ 2 本目の ssh を張った場合。動いている方に相乗りして終わる
-        return match opts.watch_pid {
-            Some(pid) => {
-                let reply = send_control(&format!("watch {pid} {}", opts.host))?;
-                if reply == "ok" || opts.background {
-                    if reply != "ok" {
-                        eprintln!("micmux: {reply}");
-                    }
-                    Ok(())
-                } else {
-                    Err(reply)
-                }
-            }
-            None => Err(format!("別の micmux connect が動いています ({})", control_path().display())),
-        };
+        return join_running_instance(&opts);
     }
     if opts.background {
         let log = opts.log_path.clone().unwrap_or_else(default_log_path);
@@ -420,20 +502,34 @@ pub fn run(opts: Options) -> Result<(), String> {
     let watch_pid = opts.watch_pid;
     if opts.background {
         eprintln!(
-            "{} micmux: 起動 (version {}, pid {}, host {}, watch-pid {:?}, 取得 {:?})",
+            "{} micmux: 起動 (version {}, pid {}, host {}, watch-pid {:?}, mux {}, 取得 {:?})",
             clock(),
             env!("CARGO_PKG_VERSION"),
             std::process::id(),
             opts.host,
             watch_pid,
+            opts.mux,
             opts.source,
         );
+    }
+
+    // 接続を待っているあいだに来る別の ssh からの登録も受けられるよう、先にソケットを開く
+    let (tx, rx) = channel::<Event>();
+    let socket = spawn_control_socket(tx.clone());
+    if socket.is_err() && another_instance_running() {
+        return join_running_instance(&opts); // ほぼ同時に起動した別の micmux に先を越された
+    }
+    let _socket_file = SocketFile(socket.as_ref().ok().cloned());
+
+    if opts.mux && opts.transport.is_none() {
+        if let Err(e) = wait_for_master(&opts) {
+            eprintln!("{} micmux: {e}", clock());
+            return Err(e);
+        }
     }
     let mut child = spawn_transport(&opts).map_err(|e| format!("接続コマンドを起動できません: {e}"))?;
     let writer: Writer = Arc::new(Mutex::new(Box::new(child.stdin.take().expect("piped stdin"))));
     let mut from_bridge = child.stdout.take().expect("piped stdout");
-
-    let (tx, rx) = channel::<Event>();
     {
         let tx = tx.clone();
         thread::spawn(move || loop {
@@ -478,7 +574,6 @@ pub fn run(opts: Options) -> Result<(), String> {
         }
     };
 
-    let socket = spawn_control_socket(tx.clone());
     {
         // 端末からの操作: Enter で arm/disarm の切り替え
         let tx = tx.clone();
@@ -603,9 +698,6 @@ pub fn run(opts: Options) -> Result<(), String> {
         }
     };
 
-    if let Ok(p) = socket {
-        let _ = std::fs::remove_file(p);
-    }
     // stdin を閉じれば bridge は後片付けをして終わる
     *client.writer.lock().unwrap() = Box::new(io::sink());
     let deadline = Instant::now() + Duration::from_secs(3);
