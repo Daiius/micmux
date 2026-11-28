@@ -65,11 +65,12 @@ jobs:
           rustup default "$RUST_VERSION"
           cargo --version
       # libasound2-plugins: ALSA から PulseAudio へ繋ぐプラグイン（内蔵の取得が通る経路）
+      # alsa-utils: arecord。ALSA の既定デバイスから録るアプリ（Claude Code など）の代わりに使う
       - name: Install PulseAudio and ALSA
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pulseaudio pulseaudio-utils libasound2-plugins libasound2-dev
+            pulseaudio pulseaudio-utils libasound2-plugins libasound2-dev alsa-utils
       - name: Build (native feature)
         run: cargo build --locked --features native
       - name: End-to-end (capture command)
@@ -97,8 +98,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pipewire pipewire-pulse wireplumber pipewire-alsa pulseaudio-utils libasound2-dev
+            pipewire pipewire-pulse wireplumber pipewire-alsa pulseaudio-utils libasound2-dev alsa-utils
           pipewire --version
+          wireplumber --version
       - name: Build (native feature)
         run: cargo build --locked --features native
       - name: End-to-end (capture command)

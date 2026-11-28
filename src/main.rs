@@ -29,6 +29,7 @@ Local side (where the microphone is):
       --transport <cmd>       connect with this command instead of ssh
       --sink-name <name>      name of the virtual mic (default micmux; source micmux.monitor)
       --set-default           make the virtual mic the remote default source while connected
+                              (on PipeWire, through a separate source micmux_mic)
       --no-bell               do not ring the bell when denying a request
       --background            detach from the terminal (log: ~/.local/state/micmux/client.log)
       --watch-pid <pid>       exit when this process exits
