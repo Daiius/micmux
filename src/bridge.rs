@@ -1,11 +1,12 @@
 //! 接続先 (Linux) で SSH から起動される側。
 //!
-//! - 仮想マイク (null sink とその monitor source) を用意する
+//! - 仮想マイク (null sink とその monitor source) を用意する。PipeWire で既定の録音デバイスにするときは、
+//!   独立した source も作る（`DefaultMic`）
 //! - 仮想マイクへの録音ストリームを監視し、有無の変化を START / STOP として client に伝える
 //! - client から届いた PCM を仮想マイクへ流す
 //!
 //! PulseAudio とのやりとりは `pactl` / `pacat` の子プロセスで行う。libpulse にリンクしないので
-//! ビルドに開発ヘッダが要らない。pipewire-pulse でも同じコマンドが使える（動作は未確認）。
+//! ビルドに開発ヘッダが要らない。pipewire-pulse でも同じコマンドが使える。
 //!
 //! stdout はプロトコル専用。ログはすべて stderr に出す。
 
@@ -119,9 +120,25 @@ pub fn count_active(listing: &str, source: u32) -> usize {
     count
 }
 
+/// PipeWire で、既定の録音デバイスにするための独立した source。
+///
+/// PipeWire 1.6 系では、既定の録音デバイスを sink の monitor にしても、デバイスを指定しない録音は
+/// 既定の出力先（捨て先）の monitor に繋がる。アプリの録音が仮想マイクに届かない。
+/// そこで、monitor ではない source（`<sink>_mic`）を別に作って、そちらを既定にする。
+/// 音は、録音セッションのあいだだけ、sink の monitor ポートからこの source の入力ポートへ
+/// `pw-link` でつないで渡す。つなぎっぱなしにすると、どちらも休止できず、待機中も CPU を使う。
+struct DefaultMic {
+    name: String,
+    index: u32,
+    /// 自分で読み込んだ module。終了時に片付ける。
+    module: Option<String>,
+}
+
 struct VirtualMic {
     sink: String,
     source_index: u32,
+    /// PipeWire で `--set-default` のときだけ作る。
+    default_mic: Option<DefaultMic>,
     /// 自分で読み込んだ module。終了時に片付ける。
     module: Option<String>,
     /// 差し替え前の既定 source。終了時に戻す。
@@ -143,19 +160,130 @@ fn default_sink() -> Result<Option<String>, String> {
     Ok(Some(name).filter(|s| !s.is_empty()))
 }
 
+/// `pactl info` の出力から、音声サーバーが PipeWire (pipewire-pulse) かどうかを見分ける。
+/// pipewire-pulse は `Server Name: PulseAudio (on PipeWire 1.4.2)` のように名乗る。
+fn is_pipewire(info: &str) -> bool {
+    info.lines().any(|l| l.starts_with("Server Name:") && l.contains("PipeWire"))
+}
+
+/// `pw-link` を実行する。PipeWire に直接話しかける（pactl には、ポートをつなぐ手段が無い）。
+fn pw_link(args: &[&str]) -> Result<(), String> {
+    let out = Command::new("pw-link")
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run pw-link: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("pw-link {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
 impl VirtualMic {
-    fn source_name(&self) -> String {
+    /// sink の monitor。名前を指定して録るアプリは、こちらを使う。
+    fn monitor_name(&self) -> String {
         format!("{}.monitor", self.sink)
     }
 
+    /// アプリに使ってもらう source の名前。既定にするための source を作ったときは、そちら。
+    fn source_name(&self) -> String {
+        match &self.default_mic {
+            Some(d) => d.name.clone(),
+            None => self.monitor_name(),
+        }
+    }
+
+    /// 録音セッションのあいだだけ張るリンクの両端（sink の monitor ポート → 既定用の source の入力ポート）。
+    /// 仮想マイクはモノラルで作るので、ポートの名前は決まっている。
+    fn session_link(&self) -> Option<(String, String)> {
+        self.default_mic.as_ref().map(|d| (format!("{}:monitor_MONO", self.sink), format!("{}:input_MONO", d.name)))
+    }
+
+    /// 録音セッションで張るリンクが、実際に張れることを起動時に確かめる。張れなければ、独立した source を
+    /// やめて、monitor を既定にする動作に戻す。
+    ///
+    /// `pw-link` があっても、つなげるとは限らない。`pw-link` は `pactl` とは別の経路で音声サーバーに繋がるので、
+    /// 片方だけが別の音声サーバーを指している環境では、ポートが見つからない。
+    fn check_session_link(&mut self) {
+        let Some((from, to)) = self.session_link() else { return };
+        // 前の bridge が後片付けをせずに終わっていると、リンクが残っている。残っていると、仮想マイクが
+        // 休止できず、待機中も CPU を使う。先に外す（無ければ失敗するが、構わない）
+        let _ = pw_link(&["-d", "--", &from, &to]);
+        // 作った直後は、ポートがまだ見えないことがある。少し待って試す
+        let mut result = pw_link(&["--", &from, &to]);
+        for _ in 0..10 {
+            if result.is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+            result = pw_link(&["--", &from, &to]);
+        }
+        match result {
+            // 張ったままにしない。録音のたびに張り直す
+            Ok(()) => {
+                let _ = pw_link(&["-d", "--", &from, &to]);
+            }
+            Err(e) => {
+                log!("micmux bridge: cannot link the virtual mic to a separate source, using the sink monitor as the default device: {e}");
+                if let Some(id) = self.default_mic.take().and_then(|d| d.module) {
+                    let _ = pactl(&["unload-module", &id]);
+                }
+            }
+        }
+    }
+
+    /// PipeWire で、既定の録音デバイスにするための source を作る。作れなければ `None`（monitor を既定にする）。
+    fn create_default_mic(&self) -> Option<DefaultMic> {
+        let name = format!("{}_mic", self.sink);
+        let module = match find_index("sources", &name) {
+            Ok(Some(_)) => None, // 前の bridge が残したもの。そのまま使う
+            Ok(None) => {
+                let loaded = pactl(&[
+                    "load-module",
+                    "module-null-sink",
+                    "media.class=Audio/Source/Virtual",
+                    &format!("sink_name={name}"),
+                    "rate=16000",
+                    "channels=1",
+                    "format=s16le",
+                    &format!("sink_properties=device.description={name}"),
+                ]);
+                match loaded {
+                    Ok(id) => Some(id.trim().to_string()),
+                    Err(e) => {
+                        log!("micmux bridge: cannot create a separate source for the default device, using the sink monitor: {e}");
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                log!("micmux bridge: cannot look up sources, using the sink monitor as the default device: {e}");
+                return None;
+            }
+        };
+        match find_index("sources", &name) {
+            Ok(Some(index)) => Some(DefaultMic { name, index, module }),
+            other => {
+                log!("micmux bridge: source '{name}' not found ({other:?}), using the sink monitor as the default device");
+                if let Some(id) = module {
+                    let _ = pactl(&["unload-module", &id]);
+                }
+                None
+            }
+        }
+    }
+
     fn setup(opts: &Options) -> Result<VirtualMic, String> {
-        pactl(&["info"]).map_err(|e| {
+        let info = pactl(&["info"]).map_err(|e| {
             format!("cannot connect to the sound server; check that PulseAudio or pipewire-pulse is running ({e})")
         })?;
         let sink = opts.sink_name.clone();
         let mut mic = VirtualMic {
             sink: sink.clone(),
             source_index: 0,
+            default_mic: None,
             module: None,
             prev_default: None,
             discard_module: None,
@@ -195,15 +323,25 @@ impl VirtualMic {
         };
         // 上の確認をすり抜けた場合の保険（代役の sink の名前が違う音声サーバーなど）
         mic.guard_default_sink();
-        match find_index("sources", &mic.source_name()) {
+        match find_index("sources", &mic.monitor_name()) {
             Ok(Some(i)) => mic.source_index = i,
             other => {
                 mic.teardown();
-                return Err(format!("source '{}' not found ({other:?})", mic.source_name()));
+                return Err(format!("source '{}' not found ({other:?})", mic.monitor_name()));
             }
         }
         if opts.set_default {
+            // 先に読む。独立した source を作ると、音声サーバーがそれを既定に選び直すことがある
             let prev = pactl(&["get-default-source"]).map(|s| s.trim().to_string()).ok();
+            if is_pipewire(&info) {
+                // pw-link が使えないなら、独立した source は作らない。作っても音を渡せず、既定から録るアプリに
+                // 無音が届くだけになる。monitor を既定にする、これまでの動作にする
+                match pw_link(&["--version"]) {
+                    Ok(()) => mic.default_mic = mic.create_default_mic(),
+                    Err(e) => log!("micmux bridge: pw-link is not usable, using the sink monitor as the default device: {e}"),
+                }
+                mic.check_session_link();
+            }
             if prev.as_deref() != Some(&mic.source_name()) {
                 if let Err(e) = pactl(&["set-default-source", &mic.source_name()]) {
                     log!("micmux bridge: cannot change the default source: {e}");
@@ -266,7 +404,9 @@ impl VirtualMic {
     }
 
     fn active_recorders(&self) -> Result<usize, String> {
-        Ok(count_active(&pactl(&["list", "source-outputs"])?, self.source_index))
+        let listing = pactl(&["list", "source-outputs"])?;
+        let on_default = self.default_mic.as_ref().map_or(0, |d| count_active(&listing, d.index));
+        Ok(count_active(&listing, self.source_index) + on_default)
     }
 
     fn teardown(&mut self) {
@@ -274,6 +414,9 @@ impl VirtualMic {
             if !prev.is_empty() {
                 let _ = pactl(&["set-default-source", &prev]);
             }
+        }
+        if let Some(id) = self.default_mic.take().and_then(|d| d.module) {
+            let _ = pactl(&["unload-module", &id]);
         }
         if let Some(id) = self.module.take() {
             let _ = pactl(&["unload-module", &id]);
@@ -293,10 +436,21 @@ struct Playback {
     child: Child,
     stdin: Option<ChildStdin>,
     bytes: u64,
+    /// このセッションのために張ったリンク（`VirtualMic::session_link`）。drop で外す。
+    link: Option<(String, String)>,
 }
 
 impl Playback {
-    fn start(sink: &str, rate: u32, channels: u8, latency_ms: u32) -> io::Result<Playback> {
+    fn start(mic: &VirtualMic, rate: u32, channels: u8, latency_ms: u32) -> io::Result<Playback> {
+        let sink = &mic.sink;
+        // 流し込む前につなぐ。先に流すと、冒頭が既定用の source に届かない
+        let link = mic.session_link().filter(|(from, to)| match pw_link(&["--", from, to]) {
+            Ok(()) => true,
+            Err(e) => {
+                log!("micmux bridge: cannot connect the virtual mic to the default source; apps recording from the default device get silence: {e}");
+                false
+            }
+        });
         let mut child = Command::new("pacat")
             .args([
                 "--playback",
@@ -314,7 +468,7 @@ impl Playback {
             .stderr(Stdio::inherit())
             .spawn()?;
         let stdin = child.stdin.take();
-        Ok(Playback { child, stdin, bytes: 0 })
+        Ok(Playback { child, stdin, bytes: 0, link })
     }
 
     fn write(&mut self, pcm: &[u8]) -> io::Result<()> {
@@ -333,6 +487,10 @@ impl Drop for Playback {
         drop(self.stdin.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // 張ったままにすると、仮想マイクが休止できない
+        if let Some((from, to)) = self.link.take() {
+            let _ = pw_link(&["-d", "--", &from, &to]);
+        }
     }
 }
 
@@ -605,7 +763,7 @@ fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(
                         continue;
                     }
                     playback = None; // 前の pacat を止めてから起動し直す
-                    match Playback::start(&mic.sink, rate, channels, opts.latency_ms) {
+                    match Playback::start(mic, rate, channels, opts.latency_ms) {
                         Ok(p) => playback = Some(p),
                         Err(e) => log!("micmux bridge: cannot start pacat: {e}"),
                     }
@@ -647,7 +805,7 @@ fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::count_active;
+    use super::{count_active, is_pipewire};
 
     const LISTING: &str = "\
 Source Output #3
@@ -669,6 +827,15 @@ Source Output #5
 \tSource: 2
 \tCorked: no
 ";
+
+    #[test]
+    fn pipewire_を名乗る音声サーバーを見分ける() {
+        assert!(is_pipewire("Server String: /run/user/1000/pulse/native\nServer Name: PulseAudio (on PipeWire 1.4.2)\n"));
+        assert!(!is_pipewire("Server String: /run/user/1000/pulse/native\nServer Name: pulseaudio\n"));
+        // ほかの行に出てくるだけでは、PipeWire とみなさない
+        assert!(!is_pipewire("Server Name: pulseaudio\nDefault Sink: PipeWire-out\n"));
+        assert!(!is_pipewire(""));
+    }
 
     #[test]
     fn counts_only_uncorked_streams_on_our_source() {

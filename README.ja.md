@@ -42,7 +42,9 @@ tmux やターミナルエミュレーターには依存しない。
 | `LocalCommand` からの自動起動、裏での動作 | macOS で実測で確認 |
 | `--mux` による接続の相乗り（認証 1 回）、`Match exec` からの起動 | macOS と指紋認証の鍵で実測で確認 |
 | 裏で動かしたときのマイクの許可の引き継ぎ | macOS で実測で確認（端末から直接の場合と同じ音量が取れる） |
-| 接続先が pipewire-pulse | CI とコンテナ（Debian 13 の PipeWire 1.4.2）で、通しの試験が通る。ALSA 経由の録音と `--set-default` も確認。実際の音声デバイスがある機械では未確認。日常的に使っている接続先は PulseAudio 17.0 |
+| 接続先が PulseAudio 17.0 | 実測で確認。ただし、仮想マイクの音が 1〜2 秒遅れて届く（既知の制限を参照） |
+| 接続先が PipeWire 1.4.2（Debian 13） | 実測で確認。日常的に使っている接続先はこの構成 |
+| 接続先が PipeWire 1.6 系 | CI とコンテナの通しの試験で確認（1.6.2・1.6.9・1.6.11）。実際の接続先では未確認 |
 | Codex CLI | 未確認。0.162.1 の Linux 版バイナリには録音の実装が見当たらない（後述） |
 
 ## セットアップ
@@ -163,6 +165,10 @@ micmux debug dev-server
 PULSE_SOURCE=micmux.monitor claude
 ```
 
+既定にするデバイスの名前は、音声サーバーで違う。PulseAudio では `micmux.monitor`、PipeWire では
+`micmux_mic`（既定にするためだけに作る、独立した録音デバイス）。`PULSE_SOURCE` で指定する名前は、
+どちらでも `micmux.monitor` である。
+
 ### 主なオプション
 
 | オプション | 意味 |
@@ -276,6 +282,16 @@ macOS (Apple シリコン、内蔵マイク) から Debian へ、往復 約 10 m
   START から最初の音声が届くまでの実測値は、macOS (Core Audio) で約 110 ms、
   Linux (ALSA → PulseAudio) で 0.6〜1.0 秒。macOS からなら実用上ほぼ気にならないが、
   Linux を接続元にする場合はキーを押してひと呼吸おいてから話す必要がある。
+- **接続先の音声サーバーが PulseAudio のとき、音が 1〜2 秒遅れて届く。** 音は失われないが、話し終えて
+  すぐ録音を止めると、末尾が切れる。PulseAudio の仮想デバイスの性質で、micmux を通さなくても起きる
+  （[#15](https://github.com/Daiius/micmux/issues/15)）。PipeWire では約 0.15 秒である。Debian の接続先を
+  PipeWire に替えるには、`scripts/switch-debian-server-to-pipewire.sh` を使う（`--check` で、変更せずに内容を
+  確かめられる。`--rollback` で戻せる）。PipeWire は、常駐するプロセスが 3 つに増える。Debian 13 の安定版には
+  未修正の脆弱性もある（[prd/05](./prd/05-security.md) §3.7）。
+- **PipeWire の版によって、動きが違う。** 確かめたのは 1.4.2 と 1.6 系（1.6.2・1.6.9・1.6.11）である。
+  1.6 系では、既定の録音デバイスの扱いが 1.4 系と違い、micmux は `--set-default` のときに独立した録音デバイスを
+  作って対応している（[#18](https://github.com/Daiius/micmux/issues/18)）。`--set-default` を使わずに、自分で
+  `micmux.monitor` を既定の録音デバイスにすると、1.6 系では録音が届かない。
 - 送信が詰まっている最中は、取得スレッドの停止が送信の完了待ちになる。接続先が受信を止めると、
   その間は `micmux disarm` や `q` が効かず（`timeout` と返る）、マイクも開いたままになる。
   止めた後の音声が送られることはない。抜け出すには Ctrl+C か、micmux のプロセスを kill する。

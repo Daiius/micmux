@@ -29,6 +29,7 @@ Local side (where the microphone is):
       --transport <cmd>       connect with this command instead of ssh
       --sink-name <name>      name of the virtual mic (default micmux; source micmux.monitor)
       --set-default           make the virtual mic the remote default source while connected
+                              (on PipeWire, through a separate source micmux_mic)
       --no-bell               do not ring the bell when denying a request
       --background            detach from the terminal (log: ~/.local/state/micmux/client.log)
       --watch-pid <pid>       exit when this process exits
@@ -95,9 +96,13 @@ impl Args {
 }
 
 /// 接続先のシェルに渡すので、名前は安全な文字だけに限る。
+/// 先頭の `-` も断る。名前は `pactl` や `pw-link` の引数の先頭に来るので、オプションとして読まれてしまう。
 fn checked_name(name: String) -> Result<String, String> {
-    let ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    ok.then_some(name).ok_or_else(|| "--sink-name may contain only letters, digits, '_' and '-'".into())
+    let ok = !name.is_empty()
+        && !name.starts_with('-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    ok.then_some(name)
+        .ok_or_else(|| "--sink-name may contain only letters, digits, '_' and '-', and must not start with '-'".into())
 }
 
 fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
@@ -258,5 +263,22 @@ fn doctor() -> Result<(), String> {
         Err("required checks failed".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_name;
+
+    #[test]
+    fn 仮想マイクの名前は安全な文字だけ() {
+        assert_eq!(checked_name("micmux".into()).as_deref(), Ok("micmux"));
+        assert_eq!(checked_name("mic_2-b".into()).as_deref(), Ok("mic_2-b"));
+        assert!(checked_name(String::new()).is_err());
+        assert!(checked_name("a b".into()).is_err());
+        assert!(checked_name("a;b".into()).is_err());
+        assert!(checked_name("a.monitor".into()).is_err());
+        // オプションとして読まれる
+        assert!(checked_name("-m".into()).is_err());
     }
 }

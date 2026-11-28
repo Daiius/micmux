@@ -58,8 +58,8 @@
 | 接続元 | macOS | 実機で確認済み |
 | 接続元 | Linux | 動く（`native` feature か `--capture-cmd`）。マイクの起動が遅い（[04](./04-audio.md) §6） |
 | 接続元 | Windows | **未対応**。Unix ソケット・シグナル・`sh -c` に依存しており、ビルドも通らない |
-| 接続先 | Linux + PulseAudio | Debian 13 / PulseAudio 17.0 で確認済み |
-| 接続先 | Linux + pipewire-pulse | CI の通しの試験で確認（[04-audio](./04-audio.md) §1）。実際の音声デバイスがある機械では**未確認** |
+| 接続先 | Linux + PulseAudio | Debian 13 / PulseAudio 17.0 で確認済み。仮想マイクの音が 1〜2 秒遅れる（[04-audio](./04-audio.md) §6.1） |
+| 接続先 | Linux + pipewire-pulse | Debian 13 / PipeWire 1.4.2 で確認済み。1.6 系は CI とコンテナの通しの試験で確認（[04-audio](./04-audio.md) §1.2）。版によって動きが違う |
 
 ## 3. 検討した代替手段
 

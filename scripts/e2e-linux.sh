@@ -13,7 +13,8 @@
 #
 # 音声サーバーは E2E_SERVER で選ぶ。pulseaudio（既定）か pipewire（pipewire-pulse + WirePlumber）。
 #
-# 要るもの: pactl, pacat, parec, python3 と、
+# 要るもの: pactl, pacat, parec, python3 と（arecord があれば、ALSA の既定デバイスからの録音も確かめる。
+# E2E_REQUIRE_ARECORD=1 で、それができないときに失敗させる）、
 #   pulseaudio のとき: pulseaudio
 #   pipewire のとき:   pipewire, pipewire-pulse, wireplumber
 # E2E_NATIVE=1 のときは、ALSA から音声サーバーへ繋ぐプラグインも要る
@@ -56,6 +57,9 @@ cleanup() {
   for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
   if [ "$FAILED" -ne 0 ]; then
     echo "---- client.log"; cat "$W/client.log" 2>/dev/null || true
+    echo "---- client4.log"; cat "$W/client4.log" 2>/dev/null || true
+    echo "---- client5.log"; cat "$W/client5.log" 2>/dev/null || true
+    echo "---- client6.log"; cat "$W/client6.log" 2>/dev/null || true
     echo "---- pulse.log";  tail -n 20 "$W/pulse.log" 2>/dev/null || true
     echo "---- pipewire.log"; tail -n 20 "$W/pipewire.log" "$W/wireplumber.log" 2>/dev/null || true
   fi
@@ -93,6 +97,9 @@ PY
 
 status_has() { "$BIN" status 2>/dev/null | grep -q "$1"; }
 sink_exists() { pactl list short sinks | cut -f2 | grep -qx "$1"; }
+# アプリが録音に使うデバイスの名前。音声サーバーで違うので、client のログから読む
+# （PulseAudio では <名前>.monitor、PipeWire では <名前>）
+vmic_of() { sed -n 's/.*connected to .*; virtual mic: //p' "$1" | head -n 1; }
 
 echo "== start a dedicated sound server"
 # D-Bus を切り離さないと、利用者の音声サーバーと名前が衝突して起動しない
@@ -166,6 +173,9 @@ unset PULSE_SOURCE
 wait_for 15 grep -q 'connected to' "$W/client.log" || fail "client did not connect"
 status_has 'armed=true' || fail "not armed"
 wait_for 5 sink_exists e2e || fail "virtual mic was not created"
+VMIC="$(vmic_of "$W/client.log")"
+[ -n "$VMIC" ] || fail "client did not report the name of the virtual mic"
+echo "   virtual mic: $VMIC"
 ok "connection and virtual mic"
 
 echo "== the virtual mic is not the default sink"
@@ -189,7 +199,7 @@ TONE=$!
 PIDS+=("$TONE")
 
 echo "== armed: recording from the virtual mic yields the fake mic's tone"
-timeout 4 parec --device=e2e.monitor --raw --rate=16000 --channels=1 --format=s16le >"$W/armed.raw" || true
+timeout 4 parec --device="$VMIC" --raw --rate=16000 --channels=1 --format=s16le >"$W/armed.raw" || true
 read -r rms freq < <(analyze "$W/armed.raw")
 echo "   rms=$rms freq=${freq}Hz"
 [ "$rms" -gt 1000 ] || fail "no audio arrived (rms=$rms)"
@@ -212,7 +222,7 @@ PY
 NOISE=$!
 PIDS+=("$NOISE")
 sleep 0.5
-timeout 2 parec --device=e2e.monitor --raw --rate=16000 --channels=1 --format=s16le >"$W/disarmed.raw" || true
+timeout 2 parec --device="$VMIC" --raw --rate=16000 --channels=1 --format=s16le >"$W/disarmed.raw" || true
 read -r rms _ < <(analyze "$W/disarmed.raw")
 echo "   rms=$rms"
 kill "$NOISE" 2>/dev/null || true
@@ -222,7 +232,7 @@ ok "denial while disarmed"
 
 echo "== re-arming makes audio arrive again"
 "$BIN" arm >/dev/null
-timeout 3 parec --device=e2e.monitor --raw --rate=16000 --channels=1 --format=s16le >"$W/rearmed.raw" || true
+timeout 3 parec --device="$VMIC" --raw --rate=16000 --channels=1 --format=s16le >"$W/rearmed.raw" || true
 read -r rms _ < <(analyze "$W/rearmed.raw")
 echo "   rms=$rms"
 [ "$rms" -gt 1000 ] || fail "no audio after re-arming (rms=$rms)"
@@ -240,6 +250,7 @@ CLIENT2=$!
 PIDS+=("$CLIENT2")
 wait_for 15 grep -q 'connected to' "$W/client2.log" || fail "second client did not connect"
 wait_for 5 sink_exists e2e2 || fail "second virtual mic was not created"
+VMIC2="$(vmic_of "$W/client2.log")"
 ok "second connection"
 
 echo "== the remote side is restored when the client exits abruptly"
@@ -260,7 +271,7 @@ wait_for 5 moved || fail "default sink is still $(pactl get-default-sink)"
 NOISE=$!
 PIDS+=("$NOISE")
 sleep 0.5
-timeout 2 parec --device=e2e2.monitor --raw --rate=16000 --channels=1 --format=s16le >"$W/second.raw" || true
+timeout 2 parec --device="$VMIC2" --raw --rate=16000 --channels=1 --format=s16le >"$W/second.raw" || true
 kill "$NOISE" 2>/dev/null || true
 read -r rms _ < <(analyze "$W/second.raw")
 echo "   rms=$rms"
@@ -273,7 +284,7 @@ ok "default sink re-check, and cleanup"
 
 echo "== the default sink is left alone when it cannot be checked"
 # 実体のある出力先の代わりに、スピーカー役の sink を既定にしておく
-pactl load-module module-null-sink sink_name=speaker >/dev/null
+SPEAKER_MODULE="$(pactl load-module module-null-sink sink_name=speaker)"
 pactl set-default-sink speaker
 # get-default-sink だけ失敗する pactl。古い音声サーバーなど、確かめる手段が無い環境の代わり
 mkdir -p "$W/fakebin"
@@ -299,7 +310,148 @@ wait_for 5 gone3 || fail "third virtual mic is left behind"
 [ "$(pactl get-default-sink)" = speaker ] || fail "default sink changed after exit"
 ok "no changes when the check fails"
 
+echo "== an app that records from the default device reaches the virtual mic"
+# Claude Code などは、デバイスを指定せずに、既定の録音デバイスから録る。上の検査は、仮想マイクを
+# 名前で指定して録っているので、この経路を通らない。--set-default を付けた bridge で確かめる。
+# 実体のある出力先が無い状態（捨て先が既定の出力先になる）に戻してから行う。PipeWire 1.6 系では、
+# 仮想マイクが sink の monitor だと、この録音が捨て先の monitor に繋がってしまう
+pactl unload-module "$SPEAKER_MODULE"
+# マイクの代わりに、1 kHz を実時間で出し続けるコマンド
+cat >"$W/tonegen.py" <<'TONEGEN'
+import math, os, struct, time
+chunk = b''.join(struct.pack('<h', int(12000 * math.sin(2 * math.pi * 1000 * i / 16000))) for i in range(320))
+start, n = time.monotonic(), 0
+try:
+    while True:
+        os.write(1, chunk)   # 20 ms ぶん。1 kHz はちょうど 20 周期なので、つなぎ目で途切れない
+        n += 1
+        time.sleep(max(0, start + n * 0.02 - time.monotonic()))
+except OSError:
+    pass
+TONEGEN
+MICMUX_SOCKET="$W/fourth.sock" "$BIN" connect --armed --max-seconds 0 \
+  --transport "$BIN bridge --sink-name e2e4 --set-default" --capture-cmd "python3 $W/tonegen.py" \
+  </dev/null >"$W/client4.log" 2>&1 &
+CLIENT4=$!
+PIDS+=("$CLIENT4")
+wait_for 15 grep -q 'connected to' "$W/client4.log" || fail "fourth client did not connect"
+VMIC4="$(vmic_of "$W/client4.log")"
+is_default() { [ "$(pactl get-default-source)" = "$VMIC4" ]; }
+wait_for 5 is_default || fail "the virtual mic is not the default source ($(pactl get-default-source))"
+[ "$(pactl get-default-sink)" = e2e4_discard ] || fail "the default sink is $(pactl get-default-sink), not the discard sink"
+# 同時に、既定の出力先へ 3 kHz を鳴らす。録音が捨て先に繋がっていると、こちらが録れてしまう
+( while cat "$W/noise.raw"; do :; done 2>/dev/null ) \
+  | pacat --playback --raw --rate=48000 --channels=1 --format=s16le --latency-msec=50 &
+NOISE=$!
+PIDS+=("$NOISE")
+timeout 5 parec --raw --rate=16000 --channels=1 --format=s16le --latency-msec=20 >"$W/default.raw" || true
+read -r rms freq < <(analyze "$W/default.raw")
+echo "   pulse client: rms=$rms freq=${freq}Hz"
+[ "$rms" -gt 1000 ] || fail "recording from the default device got no audio (rms=$rms)"
+[ "$freq" -ge 950 ] && [ "$freq" -le 1050 ] \
+  || fail "recording from the default device got the wrong sound (${freq}Hz); it is not connected to the virtual mic"
+# ALSA の既定デバイスから（Claude Code と同じ経路）。arecord があり、ALSA の既定デバイスが音声サーバーに
+# 向いているときだけ。向いていないと（プラグインが無い、~/.asoundrc で変えている）、arecord が実際の
+# マイクを開いてしまう
+alsa_default="$(arecord -L 2>/dev/null | grep -A1 -x default | tail -n 1 || true)"
+if grep -qiE 'pulseaudio|pipewire' <<<"$alsa_default"; then
+  timeout 5 arecord -q -f S16_LE -r 16000 -c 1 -t raw >"$W/alsa.raw" 2>"$W/arecord.err" || true
+  read -r rms freq < <(analyze "$W/alsa.raw")
+  echo "   ALSA default: rms=$rms freq=${freq}Hz"
+  [ "$rms" -gt 1000 ] || fail "recording from the ALSA default device got no audio (rms=$rms): $(head -c 200 "$W/arecord.err")"
+  [ "$freq" -ge 950 ] && [ "$freq" -le 1050 ] \
+    || fail "recording from the ALSA default device got the wrong sound (${freq}Hz)"
+elif [ "${E2E_REQUIRE_ARECORD:-0}" = 1 ]; then
+  fail "the ALSA default device does not go to the sound server, or arecord is missing ('$alsa_default')"
+else
+  echo "   (skipping the ALSA default device: arecord is missing, or the ALSA default does not go to the sound server)"
+fi
+# disarmed のあいだは、既定の録音デバイスから録っても何も入らない。既定の出力先で鳴っている音も入らない
+MICMUX_SOCKET="$W/fourth.sock" "$BIN" disarm >/dev/null
+sleep 0.5
+timeout 2 parec --raw --rate=16000 --channels=1 --format=s16le --latency-msec=20 >"$W/default-disarmed.raw" || true
+read -r rms _ < <(analyze "$W/default-disarmed.raw")
+echo "   disarmed: rms=$rms"
+[ "$rms" -lt 50 ] || fail "the default device carried sound while disarmed (rms=$rms)"
+kill "$NOISE" 2>/dev/null || true
+# PipeWire では、録音のあいだだけ、仮想マイクから既定用の source へリンクを張る。張ったままだと、
+# 仮想マイクが休止できず、待機中も CPU を使う
+if [ "$SERVER" = pipewire ]; then
+  [ "$VMIC4" = e2e4_mic ] || fail "on PipeWire the default source should be e2e4_mic, got $VMIC4"
+  unlinked() { ! pw-link -l 2>/dev/null | grep -q 'e2e4_mic:input'; }
+  wait_for 5 unlinked || fail "the link to the default source was left in place after recording ended"
+fi
+kill "$CLIENT4"
+wait "$CLIENT4" 2>/dev/null || true
+source_exists() { pactl list short sources | cut -f2 | grep -qx "$1"; }
+gone4() { ! sink_exists e2e4 && ! sink_exists e2e4_discard && ! source_exists e2e4_mic; }
+wait_for 5 gone4 || fail "fourth virtual mic, its discard sink or its default source was left behind"
+[ "$(pactl get-default-source)" != "$VMIC4" ] || fail "the default source was not restored"
+ok "recording from the default device"
+
+if [ "$SERVER" = pipewire ]; then
+  echo "== a link left behind by a bridge that was killed is removed"
+  # 録音中に強制終了された bridge は、仮想マイク・既定用の source・そのあいだのリンクを残す。
+  # その状態を手で作る。次の bridge は、残ったものを使い、リンクを外してから始める
+  LEFT_SINK="$(pactl load-module module-null-sink sink_name=e2e5 rate=16000 channels=1 format=s16le)"
+  LEFT_MIC="$(pactl load-module module-null-sink media.class=Audio/Source/Virtual sink_name=e2e5_mic rate=16000 channels=1 format=s16le)"
+  linkable() { pw-link e2e5:monitor_MONO e2e5_mic:input_MONO; }
+  wait_for 5 linkable || fail "could not set up the leftover link"
+  linked5() { pw-link -l 2>/dev/null | grep -q 'e2e5_mic:input'; }
+  linked5 || fail "the leftover link is not there"
+  MICMUX_SOCKET="$W/fifth.sock" "$BIN" connect --armed --max-seconds 0 \
+    --transport "$BIN bridge --sink-name e2e5 --set-default" --capture-cmd "python3 $W/tonegen.py" \
+    </dev/null >"$W/client5.log" 2>&1 &
+  CLIENT5=$!
+  PIDS+=("$CLIENT5")
+  wait_for 15 grep -q 'connected to' "$W/client5.log" || fail "fifth client did not connect"
+  unlinked5() { ! linked5; }
+  wait_for 5 unlinked5 || fail "the leftover link was not removed at startup"
+  # 残ったものを使っても、既定の録音デバイスから録れて、終わったらリンクが外れる
+  timeout 4 parec --raw --rate=16000 --channels=1 --format=s16le --latency-msec=20 >"$W/leftover.raw" || true
+  read -r rms freq < <(analyze "$W/leftover.raw")
+  echo "   rms=$rms freq=${freq}Hz"
+  [ "$rms" -gt 1000 ] || fail "recording from the default device got no audio after reusing leftovers (rms=$rms)"
+  wait_for 5 unlinked5 || fail "the link was left in place after recording ended"
+  kill "$CLIENT5"
+  wait "$CLIENT5" 2>/dev/null || true
+  # 自分で作ったものではないので、bridge は消さない
+  sink_exists e2e5 || fail "the bridge removed a sink it did not create"
+  pactl unload-module "$LEFT_MIC"
+  pactl unload-module "$LEFT_SINK"
+  ok "leftover link"
+
+  echo "== when links cannot be made, the sink monitor becomes the default device"
+  # pw-link はあるが、つなげない環境の代わり（pactl と pw-link の繋ぎ先がずれている、など）。
+  # 独立した source を既定にしても音を渡せないので、作らずに、monitor を既定にする
+  mkdir -p "$W/fakebin2"
+  cat >"$W/fakebin2/pw-link" <<'SH'
+#!/bin/sh
+[ "$1" = --version ] && exit 0
+echo "pw-link: cannot connect (fake)" >&2
+exit 1
+SH
+  chmod +x "$W/fakebin2/pw-link"
+  MICMUX_SOCKET="$W/sixth.sock" PATH="$W/fakebin2:$PATH" "$BIN" connect \
+    --transport "$BIN bridge --sink-name e2e6 --set-default" --capture-cmd "cat /dev/zero" </dev/null >"$W/client6.log" 2>&1 &
+  CLIENT6=$!
+  PIDS+=("$CLIENT6")
+  wait_for 15 grep -q 'connected to' "$W/client6.log" || fail "sixth client did not connect"
+  [ "$(vmic_of "$W/client6.log")" = e2e6.monitor ] || fail "expected the sink monitor, got $(vmic_of "$W/client6.log")"
+  [ "$(pactl get-default-source)" = e2e6.monitor ] || fail "the default source is $(pactl get-default-source), not the sink monitor"
+  ! source_exists e2e6_mic || fail "the separate source was left behind although it cannot be linked"
+  grep -q 'cannot link the virtual mic' "$W/client6.log" || fail "no log about the failed link"
+  kill "$CLIENT6"
+  wait "$CLIENT6" 2>/dev/null || true
+  gone6() { ! sink_exists e2e6; }
+  wait_for 5 gone6 || fail "sixth virtual mic was left behind"
+  ok "fallback when links cannot be made"
+fi
+
 echo "== info: time from recording request to first audio"
+# 2 つ目の値は遅れではない。disarmed で断った録音要求（上の検査では 2 秒間）が続いているうちに arm し直すと、
+# 同じ要求のまま録音が始まる。時間は断った時点の START から数えるので、断っていた 2 秒を含む。
+# 1 つ目が PulseAudio で約 2 秒になるのは、代役のマイク（null sink）が録り始めに待たせるため（prd/04 §6）
 grep -o 'first audio [0-9]* ms after START' "$W/client.log" | sed 's/^/   /' || true
 
 echo "all passed"
