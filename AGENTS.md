@@ -2,7 +2,7 @@
 
 micmux の開発を手伝うエージェント向けの手引き。
 
-> 仕様の正典は [`prd/`](./prd/)。利用者向けの手順は [`README.md`](./README.md)。
+> 仕様の正典は [`prd/`](./prd/)。利用者向けの手順は [`README.md`](./README.md)（英語）と [`README.ja.md`](./README.ja.md)（日本語）。
 
 ## micmux とは
 
@@ -145,4 +145,4 @@ micmux connect --transport "/path/to/micmux bridge --sink-name mmtest" --capture
 - マージは **merge commit**（2026-11-28 に決定）。レビュー指摘への対応などの、コミットごとの履歴を残す。
 - マージは、利用者の了承を得てから行う。
 - レビューボットの設定は [`.github/review-bot.json`](./.github/review-bot.json)。PRD の場所として
-  `prd/`・`AGENTS.md`・`README.md` を宣言している。
+  `prd/`・`AGENTS.md`・`README.md`・`README.ja.md` を宣言している。
