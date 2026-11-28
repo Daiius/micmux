@@ -35,26 +35,57 @@ PULSE_UNITS=(pulseaudio.socket pulseaudio.service)
 PIPEWIRE_UNITS=(pipewire.socket pipewire-pulse.socket wireplumber.service)
 # 止めるときは、ソケットから起動されたサービスも含める
 PIPEWIRE_ALL_UNITS=(pipewire-pulse.socket pipewire-pulse.service wireplumber.service pipewire.socket pipewire.service)
-# 戻したときに、次のログインで PulseAudio と窓口を取り合わないよう、起動を止めておくもの
-PIPEWIRE_MASK_UNITS=(pipewire-pulse.socket pipewire-pulse.service)
-MODE=switch
-APT_TARGET=()
+# 戻したときに、起動しないようにしておくもの。Debian のパッケージは、これらを全利用者向けに有効にする。
+# disable だけでは次のログインでまた起動し、PulseAudio と窓口やサウンドカードを取り合う
+PIPEWIRE_MASK_UNITS=("${PIPEWIRE_ALL_UNITS[@]}")
+
+usage() {
+  printf '%s\n' \
+    "Switch the sound server on the remote host (Debian) from PulseAudio to PipeWire." \
+    "" \
+    "  $0 --check      show the current state and what would change" \
+    "  $0              switch to PipeWire" \
+    "  $0 --rollback   go back to PulseAudio" \
+    "" \
+    "Add --backports to --check or the switch to install PipeWire from backports." >&2
+  exit 2
+}
+
+# systemctl --user は、利用者自身のセッションに対して働く。sudo で丸ごと実行すると、root のものを触る
+if [ "$(id -u)" -eq 0 ]; then
+  echo "run this as the user who owns the sound server, not as root (it calls sudo itself when needed)" >&2
+  exit 2
+fi
+
+MODE=
+BACKPORTS=0
 for arg in "$@"; do
   case "$arg" in
-    --backports)
-      suite="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")-backports"
-      # いったん変数に受ける。pipefail の下で grep -q に直接つなぐと、grep が先に終わったときに失敗扱いになる
-      policy="$(apt-cache policy pipewire)"
-      if ! grep -q "$suite" <<<"$policy"; then
-        echo "$suite is not enabled in the apt sources, so --backports cannot be used" >&2
-        exit 1
-      fi
-      APT_TARGET=(-t "$suite")
+    --backports) BACKPORTS=1 ;;
+    --check|--rollback)
+      # 2 つ指定されたら、どちらを意図したのかわからない。変更する側に倒さない
+      [ -z "$MODE" ] || usage
+      MODE="$arg"
       ;;
-    --check|--rollback) MODE="$arg" ;;
-    *) MODE=usage ;;
+    *) usage ;;
   esac
 done
+MODE="${MODE:-switch}"
+if [ "$BACKPORTS" -eq 1 ] && [ "$MODE" = --rollback ]; then usage; fi
+
+APT_TARGET=()
+if [ "$BACKPORTS" -eq 1 ]; then
+  codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+  [ -n "$codename" ] || { echo "cannot tell the release codename from /etc/os-release" >&2; exit 1; }
+  suite="$codename-backports"
+  # いったん変数に受ける。pipefail の下で grep -q に直接つなぐと、grep が先に終わったときに失敗扱いになる
+  policy="$(apt-cache policy pipewire)"
+  if ! grep -qF -- "$suite" <<<"$policy"; then
+    echo "$suite is not enabled in the apt sources, so --backports cannot be used" >&2
+    exit 1
+  fi
+  APT_TARGET=(-t "$suite")
+fi
 
 installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
 
@@ -151,7 +182,8 @@ case "$MODE" in
       check_nothing_removed "${todo[@]}"
       echo "packages to install: ${todo[*]}"
       confirm "run sudo apt-get install?" || { echo "aborted"; exit 1; }
-      sudo apt-get install -y --no-install-recommends "${APT_TARGET[@]}" -- "${todo[@]}"
+      # --no-remove: 上で確かめたあとに apt の状態が変わっていても、何かを消すことになるなら止まる
+      sudo apt-get install -y --no-install-recommends --no-remove "${APT_TARGET[@]}" -- "${todo[@]}"
     else
       echo "all packages are installed"
     fi
@@ -165,10 +197,11 @@ case "$MODE" in
     # 前に --rollback していた場合の mask を外す
     systemctl --user unmask "${PIPEWIRE_MASK_UNITS[@]}" 2>/dev/null || true
     systemctl --user disable --now "${PULSE_UNITS[@]}" 2>/dev/null || true
+    # ここから先で失敗すると、どちらの音声サーバーも動いていない状態で止まる。戻し方を必ず表示する。
     # mask しておかないと、次のログインで PulseAudio も起動して、同じ窓口を取り合う
-    systemctl --user mask "${PULSE_UNITS[@]}"
-    systemctl --user enable --now "${PIPEWIRE_UNITS[@]}"
-    if ! wait_for_server PipeWire; then
+    if ! { systemctl --user mask "${PULSE_UNITS[@]}" \
+           && systemctl --user enable --now "${PIPEWIRE_UNITS[@]}" \
+           && wait_for_server PipeWire; }; then
       echo "PipeWire did not come up; to go back: $0 --rollback" >&2
       show_status
       exit 1
@@ -190,11 +223,11 @@ case "$MODE" in
     fi
     systemctl --user daemon-reload
     systemctl --user disable --now "${PIPEWIRE_ALL_UNITS[@]}" 2>/dev/null || true
-    systemctl --user mask "${PIPEWIRE_MASK_UNITS[@]}"
-    systemctl --user unmask "${PULSE_UNITS[@]}"
-    systemctl --user enable --now "${PULSE_UNITS[@]}"
-    if ! wait_for_server pulseaudio; then
-      echo "PulseAudio did not come up" >&2
+    if ! { systemctl --user mask "${PIPEWIRE_MASK_UNITS[@]}" \
+           && systemctl --user unmask "${PULSE_UNITS[@]}" \
+           && systemctl --user enable --now "${PULSE_UNITS[@]}" \
+           && wait_for_server pulseaudio; }; then
+      echo "PulseAudio did not come up; to try PipeWire again: $0" >&2
       show_status
       exit 1
     fi
@@ -203,17 +236,5 @@ case "$MODE" in
     echo
     echo "done; reopen your SSH connections"
     echo "the PipeWire packages are still installed; to remove them: sudo apt-get remove ${PACKAGES[*]}"
-    ;;
-
-  *)
-    printf '%s\n' \
-      "Switch the sound server on the remote host (Debian) from PulseAudio to PipeWire." \
-      "" \
-      "  $0 --check      show the current state and what would change" \
-      "  $0              switch to PipeWire" \
-      "  $0 --rollback   go back to PulseAudio" \
-      "" \
-      "Add --backports to --check or the switch to install PipeWire from backports." >&2
-    exit 2
     ;;
 esac

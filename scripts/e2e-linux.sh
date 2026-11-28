@@ -13,7 +13,8 @@
 #
 # 音声サーバーは E2E_SERVER で選ぶ。pulseaudio（既定）か pipewire（pipewire-pulse + WirePlumber）。
 #
-# 要るもの: pactl, pacat, parec, python3 と（arecord があれば、ALSA の既定デバイスからの録音も確かめる）、
+# 要るもの: pactl, pacat, parec, python3 と（arecord があれば、ALSA の既定デバイスからの録音も確かめる。
+# E2E_REQUIRE_ARECORD=1 で、それができないときに失敗させる）、
 #   pulseaudio のとき: pulseaudio
 #   pipewire のとき:   pipewire, pipewire-pulse, wireplumber
 # E2E_NATIVE=1 のときは、ALSA から音声サーバーへ繋ぐプラグインも要る
@@ -57,6 +58,7 @@ cleanup() {
   if [ "$FAILED" -ne 0 ]; then
     echo "---- client.log"; cat "$W/client.log" 2>/dev/null || true
     echo "---- client4.log"; cat "$W/client4.log" 2>/dev/null || true
+    echo "---- client5.log"; cat "$W/client5.log" 2>/dev/null || true
     echo "---- pulse.log";  tail -n 20 "$W/pulse.log" 2>/dev/null || true
     echo "---- pipewire.log"; tail -n 20 "$W/pipewire.log" "$W/wireplumber.log" 2>/dev/null || true
   fi
@@ -347,17 +349,29 @@ echo "   pulse client: rms=$rms freq=${freq}Hz"
 [ "$rms" -gt 1000 ] || fail "recording from the default device got no audio (rms=$rms)"
 [ "$freq" -ge 950 ] && [ "$freq" -le 1050 ] \
   || fail "recording from the default device got the wrong sound (${freq}Hz); it is not connected to the virtual mic"
-# ALSA の既定デバイスから（Claude Code と同じ経路）。arecord があるときだけ
-if command -v arecord >/dev/null; then
+# ALSA の既定デバイスから（Claude Code と同じ経路）。arecord があり、ALSA の既定デバイスが音声サーバーに
+# 向いているときだけ。向いていないと（プラグインが無い、~/.asoundrc で変えている）、arecord が実際の
+# マイクを開いてしまう
+alsa_default="$(arecord -L 2>/dev/null | grep -A1 -x default | tail -n 1 || true)"
+if grep -qiE 'pulseaudio|pipewire' <<<"$alsa_default"; then
   timeout 5 arecord -q -f S16_LE -r 16000 -c 1 -t raw >"$W/alsa.raw" 2>"$W/arecord.err" || true
   read -r rms freq < <(analyze "$W/alsa.raw")
   echo "   ALSA default: rms=$rms freq=${freq}Hz"
   [ "$rms" -gt 1000 ] || fail "recording from the ALSA default device got no audio (rms=$rms): $(head -c 200 "$W/arecord.err")"
   [ "$freq" -ge 950 ] && [ "$freq" -le 1050 ] \
     || fail "recording from the ALSA default device got the wrong sound (${freq}Hz)"
+elif [ "${E2E_REQUIRE_ARECORD:-0}" = 1 ]; then
+  fail "the ALSA default device does not go to the sound server, or arecord is missing ('$alsa_default')"
 else
-  echo "   (arecord not found; skipping the ALSA default device)"
+  echo "   (skipping the ALSA default device: arecord is missing, or the ALSA default does not go to the sound server)"
 fi
+# disarmed のあいだは、既定の録音デバイスから録っても何も入らない。既定の出力先で鳴っている音も入らない
+MICMUX_SOCKET="$W/fourth.sock" "$BIN" disarm >/dev/null
+sleep 0.5
+timeout 2 parec --raw --rate=16000 --channels=1 --format=s16le --latency-msec=20 >"$W/default-disarmed.raw" || true
+read -r rms _ < <(analyze "$W/default-disarmed.raw")
+echo "   disarmed: rms=$rms"
+[ "$rms" -lt 50 ] || fail "the default device carried sound while disarmed (rms=$rms)"
 kill "$NOISE" 2>/dev/null || true
 # PipeWire では、録音のあいだだけ、仮想マイクから既定用の source へリンクを張る。張ったままだと、
 # 仮想マイクが休止できず、待機中も CPU を使う
@@ -373,6 +387,39 @@ gone4() { ! sink_exists e2e4 && ! sink_exists e2e4_discard && ! source_exists e2
 wait_for 5 gone4 || fail "fourth virtual mic, its discard sink or its default source was left behind"
 [ "$(pactl get-default-source)" != "$VMIC4" ] || fail "the default source was not restored"
 ok "recording from the default device"
+
+if [ "$SERVER" = pipewire ]; then
+  echo "== a link left behind by a bridge that was killed is removed"
+  # 録音中に強制終了された bridge は、仮想マイク・既定用の source・そのあいだのリンクを残す。
+  # その状態を手で作る。次の bridge は、残ったものを使い、リンクを外してから始める
+  LEFT_SINK="$(pactl load-module module-null-sink sink_name=e2e5 rate=16000 channels=1 format=s16le)"
+  LEFT_MIC="$(pactl load-module module-null-sink media.class=Audio/Source/Virtual sink_name=e2e5_mic rate=16000 channels=1 format=s16le)"
+  linkable() { pw-link e2e5:monitor_MONO e2e5_mic:input_MONO; }
+  wait_for 5 linkable || fail "could not set up the leftover link"
+  linked5() { pw-link -l 2>/dev/null | grep -q 'e2e5_mic:input'; }
+  linked5 || fail "the leftover link is not there"
+  MICMUX_SOCKET="$W/fifth.sock" "$BIN" connect --armed --max-seconds 0 \
+    --transport "$BIN bridge --sink-name e2e5 --set-default" --capture-cmd "python3 $W/tonegen.py" \
+    </dev/null >"$W/client5.log" 2>&1 &
+  CLIENT5=$!
+  PIDS+=("$CLIENT5")
+  wait_for 15 grep -q 'connected to' "$W/client5.log" || fail "fifth client did not connect"
+  unlinked5() { ! linked5; }
+  wait_for 5 unlinked5 || fail "the leftover link was not removed at startup"
+  # 残ったものを使っても、既定の録音デバイスから録れて、終わったらリンクが外れる
+  timeout 4 parec --raw --rate=16000 --channels=1 --format=s16le --latency-msec=20 >"$W/leftover.raw" || true
+  read -r rms freq < <(analyze "$W/leftover.raw")
+  echo "   rms=$rms freq=${freq}Hz"
+  [ "$rms" -gt 1000 ] || fail "recording from the default device got no audio after reusing leftovers (rms=$rms)"
+  wait_for 5 unlinked5 || fail "the link was left in place after recording ended"
+  kill "$CLIENT5"
+  wait "$CLIENT5" 2>/dev/null || true
+  # 自分で作ったものではないので、bridge は消さない
+  sink_exists e2e5 || fail "the bridge removed a sink it did not create"
+  pactl unload-module "$LEFT_MIC"
+  pactl unload-module "$LEFT_SINK"
+  ok "leftover link"
+fi
 
 echo "== info: time from recording request to first audio"
 # 2 つ目の値は遅れではない。disarmed で断った録音要求（上の検査では 2 秒間）が続いているうちに arm し直すと、

@@ -110,6 +110,7 @@
 | [#12](https://github.com/Daiius/micmux/issues/12) | 接続元の入力デバイスとチャンネルを選べない（多チャンネルの入力で音量が下がる） | 干渉の洗い出し |
 | [#13](https://github.com/Daiius/micmux/issues/13) | 接続中に接続先の既定の録音デバイスが切り替わると、仮想マイクから外れたままになる | 干渉の洗い出し |
 | [#15](https://github.com/Daiius/micmux/issues/15) | 接続先が PulseAudio のとき、仮想マイクの音が 1〜2 秒遅れて届く。原因は調べた。対処はまだ入れていない | 通しの試験のログ |
+| [#20](https://github.com/Daiius/micmux/issues/20) | bridge が後片付けをせずに終わると、仮想マイクと既定のデバイスの設定が接続先に残り続ける。接続中に利用者が替えた既定が、終了時に戻される | 干渉の洗い出し・セキュリティレビュー |
 | [#18](https://github.com/Daiius/micmux/issues/18) | PipeWire 1.6 系で、既定の録音デバイスから録るアプリの録音が届かない。`--set-default` については対応済み。実運用での確認が残る | 接続先の音声サーバーの切り替え |
 
 ## 取り下げたもの

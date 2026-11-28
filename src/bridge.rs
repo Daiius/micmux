@@ -301,7 +301,17 @@ impl VirtualMic {
             // 先に読む。独立した source を作ると、音声サーバーがそれを既定に選び直すことがある
             let prev = pactl(&["get-default-source"]).map(|s| s.trim().to_string()).ok();
             if is_pipewire(&info) {
-                mic.default_mic = mic.create_default_mic();
+                // pw-link が使えないなら、独立した source は作らない。作っても音を渡せず、既定から録るアプリに
+                // 無音が届くだけになる。monitor を既定にする、これまでの動作にする
+                match pw_link(&["--version"]) {
+                    Ok(()) => mic.default_mic = mic.create_default_mic(),
+                    Err(e) => log!("micmux bridge: pw-link is not usable, using the sink monitor as the default device: {e}"),
+                }
+                // 前の bridge が後片付けをせずに終わっていると、リンクが残っている。残っていると、仮想マイクが
+                // 休止できず、待機中も CPU を使う。次の録音で張り直すので、ここで外す（無ければ失敗するが、構わない）
+                if let Some((from, to)) = mic.session_link() {
+                    let _ = pw_link(&["-d", "--", &from, &to]);
+                }
             }
             if prev.as_deref() != Some(&mic.source_name()) {
                 if let Err(e) = pactl(&["set-default-source", &mic.source_name()]) {
@@ -405,7 +415,7 @@ impl Playback {
     fn start(mic: &VirtualMic, rate: u32, channels: u8, latency_ms: u32) -> io::Result<Playback> {
         let sink = &mic.sink;
         // 流し込む前につなぐ。先に流すと、冒頭が既定用の source に届かない
-        let link = mic.session_link().filter(|(from, to)| match pw_link(&[from, to]) {
+        let link = mic.session_link().filter(|(from, to)| match pw_link(&["--", from, to]) {
             Ok(()) => true,
             Err(e) => {
                 log!("micmux bridge: cannot connect the virtual mic to the default source; apps recording from the default device get silence: {e}");
@@ -450,7 +460,7 @@ impl Drop for Playback {
         let _ = self.child.wait();
         // 張ったままにすると、仮想マイクが休止できない
         if let Some((from, to)) = self.link.take() {
-            let _ = pw_link(&["-d", &from, &to]);
+            let _ = pw_link(&["-d", "--", &from, &to]);
         }
     }
 }

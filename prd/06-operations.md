@@ -48,7 +48,11 @@
 - `--check`: 何も変更せず、現状と、行うことを表示する。
 - 引数なし: `pipewire`・`pipewire-pulse`・`wireplumber` を確認のうえ入れ、PulseAudio のユーザーサービスを止めて
   起動しないようにし（mask）、PipeWire のユーザーサービスを起動する。
-- `--rollback`: PulseAudio に戻す。
+- `--rollback`: PulseAudio に戻す。PipeWire のユーザーサービスは、起動しないようにしておく（mask）。Debian の
+  パッケージは、これらを全利用者向けに有効にするので、止めただけでは次のログインでまた起動する。
+- 利用者自身で実行する。root では実行しない（`sudo` は、必要なところでスクリプトが呼ぶ）。
+- 切り替えの途中で失敗すると、どちらの音声サーバーも動いていない状態で止まりうる。その場合は、状態と戻し方を
+  表示して終わる。
 - `--backports`: PipeWire を、安定版ではなく backports から入れる。
 - PulseAudio のパッケージは消さない。戻せるようにするためと、ALSA から音声サーバーへ繋ぐプラグイン
   （`libasound2-plugins`）をそのまま使うためである。pipewire-pulse は PulseAudio と同じ窓口を持つので、
@@ -179,7 +183,10 @@ gap: 録音要求を断ったこと（disarmed）は、裏で動いているあ�
 - `scripts/e2e-linux.sh` で、音声の通しの試験を実行する。代役のマイク（音を流し込んだ null sink）から
   client が取得し、bridge を通って仮想マイクに届いた音を録って照合する。armed での転送、disarmed での拒否、接続先で鳴らした音が混ざらないこと（別の bridge が先に終わった場合と、既定の出力先を確かめられない場合を含む）、
   arm のし直し、client が突然終わったときの後片付け、`--set-default` を付けたときに既定の録音デバイスから
-  録れること（デバイスを指定しない `parec` と、`arecord` があれば ALSA の既定デバイス）を見る。
+  録れること（デバイスを指定しない `parec` と、`arecord` があれば ALSA の既定デバイス）、disarmed のあいだは
+  そこに何も入らないこと、PipeWire では、強制終了された bridge が残したリンクを起動時に外すことを見る。
+  `arecord` での検査は、ALSA の既定デバイスが音声サーバーに向いているときだけ行う（向いていないと、
+  実際のマイクを開いてしまう）。CI では、省かれたら失敗にする（`E2E_REQUIRE_ARECORD=1`）。
   専用の音声サーバーを一時ディレクトリに立てる。
   `E2E_NATIVE=1` で、内蔵の取得（cpal → ALSA → 音声サーバー）を通す。
   `E2E_SERVER=pipewire` で、PulseAudio の代わりに PipeWire で回す。

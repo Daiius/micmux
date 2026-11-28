@@ -21,6 +21,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # 通しの試験で、ALSA の既定デバイスからの録音（arecord）を省かせない
+  E2E_REQUIRE_ARECORD: "1"
   # lint と通常のビルドに使う版。ランナーの rustup で入れ、外部の toolchain 用 Action は使わない
   RUST_VERSION: 1.100.0
 
