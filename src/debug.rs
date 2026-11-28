@@ -18,11 +18,11 @@ fn capture_output(cmd: &mut Command) -> String {
             let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
             if !out.status.success() {
-                text.push_str(&format!("(終了コード: {})\n", out.status));
+                text.push_str(&format!("({})\n", out.status));
             }
             text
         }
-        Err(e) => format!("(実行できません: {e})\n"),
+        Err(e) => format!("(cannot run: {e})\n"),
     }
 }
 
@@ -35,7 +35,7 @@ fn indent(text: &str) {
 }
 
 fn env(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| "(未設定)".into())
+    std::env::var(name).unwrap_or_else(|_| "(unset)".into())
 }
 
 pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<(), String> {
@@ -44,30 +44,30 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
     println!("  build:   {} {}", std::env::consts::OS, std::env::consts::ARCH);
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     println!("  exe:     {exe}");
-    println!("  更新日時: {}", capture_output(Command::new("ls").args(["-l", &exe])).trim());
-    println!("  --background に対応: はい（この行が出ていれば新しい版）");
+    println!("  file:    {}", capture_output(Command::new("ls").args(["-l", &exe])).trim());
+    println!("  --background: supported (only newer versions print this line)");
     if cfg!(target_os = "macos") {
         println!("  macOS:   {}", capture_output(Command::new("sw_vers").arg("-productVersion")).trim());
     }
 
-    section("環境");
+    section("environment");
     // マイクの許可は、起動元のターミナルアプリに対して与えられる
     println!("  TERM_PROGRAM:  {}", env("TERM_PROGRAM"));
     println!("  SHELL:         {}", env("SHELL"));
-    println!("  TMUX:          {}", if std::env::var_os("TMUX").is_some() { "tmux の中" } else { "tmux の外" });
+    println!("  TMUX:          {}", if std::env::var_os("TMUX").is_some() { "inside tmux" } else { "outside tmux" });
     println!("  SSH_AUTH_SOCK: {}", env("SSH_AUTH_SOCK"));
-    println!("  PATH 上の micmux: {}", capture_output(Command::new("sh").args(["-c", "command -v micmux"])).trim());
+    println!("  micmux on PATH: {}", capture_output(Command::new("sh").args(["-c", "command -v micmux"])).trim());
 
-    section("動いている micmux");
+    section("running micmux");
     let socket = control::control_path();
-    println!("  操作用ソケット: {} ({})", socket.display(), if socket.exists() { "ある" } else { "無い" });
+    println!("  control socket: {} ({})", socket.display(), if socket.exists() { "exists" } else { "missing" });
     match control::send_control("status") {
         Ok(s) => println!("  status: {s}"),
         Err(e) => println!("  status: {e}"),
     }
-    indent(&capture_output(Command::new("sh").args(["-c", "ps -axo pid,ppid,lstart,command | grep '[m]icmux' || echo '(micmux のプロセスは無い)'"])));
+    indent(&capture_output(Command::new("sh").args(["-c", "ps -axo pid,ppid,lstart,command | grep '[m]icmux' || echo '(no micmux processes)'"])));
 
-    section("裏で動かしたときのログ (末尾 40 行)");
+    section("background log (last 40 lines)");
     match client::default_log_path() {
         Some(log) => {
             println!("  {}", log.display());
@@ -78,14 +78,14 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
                     let lines: Vec<&str> = text.lines().collect();
                     indent(&lines[lines.len().saturating_sub(40)..].join("\n"));
                 }
-                Err(e) => println!("  (読めません: {e})"),
+                Err(e) => println!("  (cannot read: {e})"),
             }
         }
-        None => println!("  (XDG_STATE_HOME も HOME も無いので場所が決まりません)"),
+        None => println!("  (unknown location: neither XDG_STATE_HOME nor HOME is set)"),
     }
 
     if let Some(host) = &host {
-        section(&format!("ssh の設定 ({host})"));
+        section(&format!("ssh config ({host})"));
         let keys = [
             "hostname ", "user ", "port ", "permitlocalcommand ", "localcommand ", "remotecommand ",
             "requesttty ", "controlmaster ", "controlpath ", "controlpersist ", "identityagent ",
@@ -94,7 +94,7 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
         let conf = capture_output(ssh::command().args(["-G", host]));
         indent(&conf.lines().filter(|l| keys.iter().any(|k| l.starts_with(k))).collect::<Vec<_>>().join("\n"));
 
-        section("端末なしでの接続（裏で動く micmux と同じ条件）");
+        section("connection without a terminal (as in the background)");
         let remote = format!("echo \"remote PATH=$PATH\"; {remote_cmd} --version; {remote_cmd} doctor");
         indent(&capture_output(ssh::command().args([
             "-T",
@@ -109,16 +109,16 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
         ])));
     } else {
         section("ssh");
-        println!("  (接続先を指定すると ssh の設定と接続も点検します: micmux debug <host>)");
+        println!("  (give a host to also check the ssh config and connection: micmux debug <host>)");
     }
 
-    section("マイク（この端末から直接）");
+    section("microphone (directly from this terminal)");
     match capture::mic_test(source, Duration::from_millis(1500)) {
         Ok(s) => println!("  {s}"),
-        Err(e) => println!("  失敗: {e}"),
+        Err(e) => println!("  failed: {e}"),
     }
 
-    section("マイク（端末から切り離して。--background と同じ条件）");
+    section("microphone (detached from the terminal, as with --background)");
     let mut cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     cmd.arg("mic-test");
     if let Source::Command { cmd: c, rate } = source {
@@ -126,6 +126,6 @@ pub fn run(host: Option<String>, remote_cmd: &str, source: &Source) -> Result<()
     }
     indent(&capture_output(client::in_new_session(&mut cmd)));
 
-    println!("\n以上です。ホスト名やユーザー名が含まれるので、貼る前に目を通してください。");
+    println!("\nend of report; it contains host and user names, so review it before sharing");
     Ok(())
 }

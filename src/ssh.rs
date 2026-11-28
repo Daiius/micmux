@@ -25,9 +25,9 @@ pub fn check_mux_config(opts: &Options) -> Result<(), String> {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .map_err(|e| format!("ssh を実行できません: {e}"))?;
+        .map_err(|e| format!("cannot run ssh: {e}"))?;
     match mux_config_problem(&String::from_utf8_lossy(&conf.stdout)) {
-        Some(key) => Err(format!("--mux には ~/.ssh/config の {} に {key} の設定が必要です", opts.host)),
+        Some(key) => Err(format!("--mux requires {key} to be set for {} in ~/.ssh/config", opts.host)),
         None => Ok(()),
     }
 }

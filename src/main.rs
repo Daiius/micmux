@@ -17,32 +17,32 @@ use std::time::Duration;
 const USAGE: &str = "\
 micmux — On-demand microphone forwarding over SSH
 
-接続元 (マイクのある側):
-  micmux connect <host> [options]   接続して録音要求を待つ
-      --armed                 最初から録音を許可する（既定は disarmed）
-      --max-seconds <n>       連続録音時間の上限（既定 120、0 で上限なし）
-      --capture-cmd <cmd>     マイク取得に使うコマンド（s16le モノラルを stdout に出すもの）
-                              例: 'rec -q -t raw -r 16000 -e signed -b 16 -c 1 -'
-      --capture-rate <hz>     --capture-cmd の出力レート（既定 16000）
-      --remote-cmd <path>     接続先での micmux の場所（既定 micmux）
-      --ssh-arg <arg>         ssh に渡す追加の引数（複数回指定できる）
-      --transport <cmd>       ssh の代わりに使う接続コマンド
-      --sink-name <name>      仮想マイクの名前（既定 micmux → 録音デバイスは micmux.monitor）
-      --set-default           接続中だけ仮想マイクを接続先の既定の録音デバイスにする
-      --no-bell               断ったときにベルを鳴らさない
-      --background            端末から切り離して裏で動く（ログは ~/.local/state/micmux/client.log）
-      --watch-pid <pid>       このプロセスが終わったら自分も終わる
-      --log <path>            --background のときのログの出力先
-      --mux                   端末用の SSH 接続に相乗りする（認証が 1 回で済む。
-                              ControlMaster / ControlPath / ControlPersist の設定が必要）
-  micmux arm | disarm | toggle      動いている connect の録音許可を切り替える
-  micmux status [--json]            動いている connect の状態を表示する
-  micmux debug [<host>]             不具合調査用に、接続元の状況をまとめて表示する
-      --remote-cmd / --capture-cmd / --capture-rate は connect と同じ
+Local side (where the microphone is):
+  micmux connect <host> [options]   connect and wait for recording requests
+      --armed                 allow recording from the start (default: disarmed)
+      --max-seconds <n>       limit on continuous recording (default 120, 0 for no limit)
+      --capture-cmd <cmd>     capture with this command (must write s16le mono to stdout)
+                              e.g. 'rec -q -t raw -r 16000 -e signed -b 16 -c 1 -'
+      --capture-rate <hz>     sample rate of the --capture-cmd output (default 16000)
+      --remote-cmd <path>     path to micmux on the remote host (default micmux)
+      --ssh-arg <arg>         extra argument for ssh (repeatable)
+      --transport <cmd>       connect with this command instead of ssh
+      --sink-name <name>      name of the virtual mic (default micmux; source micmux.monitor)
+      --set-default           make the virtual mic the remote default source while connected
+      --no-bell               do not ring the bell when denying a request
+      --background            detach from the terminal (log: ~/.local/state/micmux/client.log)
+      --watch-pid <pid>       exit when this process exits
+      --log <path>            log file for --background
+      --mux                   share the terminal's SSH connection (authenticate once;
+                              requires ControlMaster / ControlPath / ControlPersist)
+  micmux arm | disarm | toggle      allow or deny recording in the running connect
+  micmux status [--json]            show the state of the running connect
+  micmux debug [<host>]             print local diagnostics for troubleshooting
+      --remote-cmd / --capture-cmd / --capture-rate work as for connect
 
-接続先 (アプリが動く側):
-  micmux bridge [options]           connect が SSH 越しに起動する（手で実行する必要はない）
-  micmux doctor                     接続先の音声環境を点検する
+Remote side (where the apps run):
+  micmux bridge [options]           started by connect over SSH (no need to run it by hand)
+  micmux doctor                     check the remote audio setup
 ";
 
 fn main() -> ExitCode {
@@ -70,7 +70,7 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             Ok(())
         }
-        other => Err(format!("不明なコマンド: {other}\n\n{USAGE}")),
+        other => Err(format!("unknown command: {other}\n\n{USAGE}")),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -85,19 +85,19 @@ struct Args(std::vec::IntoIter<String>);
 
 impl Args {
     fn value(&mut self, flag: &str) -> Result<String, String> {
-        self.0.next().ok_or_else(|| format!("{flag} には値が必要です"))
+        self.0.next().ok_or_else(|| format!("{flag} requires a value"))
     }
 
     fn number<T: std::str::FromStr>(&mut self, flag: &str) -> Result<T, String> {
         let v = self.value(flag)?;
-        v.parse().map_err(|_| format!("{flag} の値が数値ではありません: {v}"))
+        v.parse().map_err(|_| format!("{flag} expects a number: {v}"))
     }
 }
 
 /// 接続先のシェルに渡すので、名前は安全な文字だけに限る。
 fn checked_name(name: String) -> Result<String, String> {
     let ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    ok.then_some(name).ok_or_else(|| "--sink-name に使えるのは英数字と _ - だけです".into())
+    ok.then_some(name).ok_or_else(|| "--sink-name may contain only letters, digits, '_' and '-'".into())
 }
 
 fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
@@ -140,14 +140,14 @@ fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
             "--watch-pid" => {
                 let pid = it.number(&a)?;
                 if !control::valid_watch_pid(pid) {
-                    return Err(format!("--watch-pid には 2 以上の pid を指定してください: {pid}"));
+                    return Err(format!("--watch-pid needs a pid of 2 or greater: {pid}"));
                 }
                 opts.watch_pid = Some(pid);
             }
             "--log" => opts.log_path = Some(it.value(&a)?.into()),
-            _ if a.starts_with('-') => return Err(format!("不明なオプション: {a}")),
+            _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ if host.is_none() => host = Some(a),
-            _ => return Err(format!("余分な引数: {a}")),
+            _ => return Err(format!("unexpected argument: {a}")),
         }
     }
     if let Some(cmd) = capture_cmd {
@@ -156,7 +156,7 @@ fn parse_connect(args: Vec<String>) -> Result<client::Options, String> {
     opts.host = match (host, &opts.transport) {
         (Some(h), _) => h,
         (None, Some(_)) => "(transport)".into(),
-        (None, None) => return Err(format!("接続先を指定してください\n\n{USAGE}")),
+        (None, None) => return Err(format!("missing <host>\n\n{USAGE}")),
     };
     Ok(opts)
 }
@@ -169,7 +169,7 @@ fn parse_debug(args: Vec<String>) -> Result<(Option<String>, String, capture::So
             "--remote-cmd" => remote = it.value(&a)?,
             "--capture-cmd" => cmd = Some(it.value(&a)?),
             "--capture-rate" => rate = it.number(&a)?,
-            _ if a.starts_with('-') => return Err(format!("不明なオプション: {a}")),
+            _ if a.starts_with('-') => return Err(format!("unknown option: {a}")),
             _ => host = Some(a),
         }
     }
@@ -190,7 +190,7 @@ fn parse_bridge(args: Vec<String>) -> Result<bridge::Options, String> {
             "--stop-holdoff-ms" => opts.stop_holdoff = Duration::from_millis(it.number(&a)?),
             "--latency-ms" => opts.latency_ms = it.number(&a)?,
             "--idle-timeout-ms" => opts.idle_timeout = Duration::from_millis(it.number(&a)?),
-            _ => return Err(format!("不明なオプション: {a}")),
+            _ => return Err(format!("unknown option: {a}")),
         }
     }
     Ok(opts)
@@ -204,7 +204,7 @@ fn doctor() -> Result<(), String> {
     };
     let mut failed = false;
     let mut report = |ok: bool, required: bool, what: &str, hint: &str| {
-        let mark = if ok { "ok  " } else if required { "NG  " } else { "warn" };
+        let mark = if ok { "ok  " } else if required { "fail" } else { "warn" };
         println!("[{mark}] {what}");
         if !ok {
             println!("       → {hint}");
@@ -216,8 +216,8 @@ fn doctor() -> Result<(), String> {
     report(
         info.is_some(),
         true,
-        "サウンドサーバー (PulseAudio / pipewire-pulse) に接続できる",
-        "pulseaudio か pipewire-pulse を入れて、ユーザーサービスとして起動する",
+        "sound server (PulseAudio / pipewire-pulse) is reachable",
+        "install pulseaudio or pipewire-pulse and start it as a user service",
     );
     if let Some(info) = &info {
         for key in ["Server Name:", "Default Source:"] {
@@ -229,8 +229,8 @@ fn doctor() -> Result<(), String> {
     report(
         run("pacat", &["--version"]).is_some(),
         true,
-        "pacat がある（仮想マイクへの流し込みに使う）",
-        "pulseaudio-utils を入れる",
+        "pacat is installed (used to feed the virtual mic)",
+        "install pulseaudio-utils",
     );
     let plugin = ["/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib"]
         .iter()
@@ -242,8 +242,8 @@ fn doctor() -> Result<(), String> {
     report(
         plugin,
         false,
-        "ALSA からサウンドサーバーへ繋ぐプラグインがある（Claude Code など ALSA で録音するアプリに必要）",
-        "libasound2-plugins (PulseAudio) か pipewire-alsa (PipeWire) を入れる",
+        "ALSA plugin for the sound server is installed (needed by apps that record via ALSA, such as Claude Code)",
+        "install libasound2-plugins (PulseAudio) or pipewire-alsa (PipeWire)",
     );
     let cards = std::fs::read_to_string("/proc/asound/cards")
         .map(|s| !s.trim().is_empty() && !s.contains("no soundcards"))
@@ -251,11 +251,11 @@ fn doctor() -> Result<(), String> {
     report(
         cards || run("arecord", &["--version"]).is_some(),
         false,
-        "サウンドカードがある、または arecord がある（Claude Code が録音方法を選ぶ条件）",
-        "サウンドカードの無い VM では alsa-utils を入れる（arecord 経由で録音される）",
+        "a sound card or arecord is present (Claude Code needs one to choose a recording method)",
+        "on a VM without a sound card, install alsa-utils (recording then goes through arecord)",
     );
     if failed {
-        Err("必須の項目が満たされていません".into())
+        Err("required checks failed".into())
     } else {
         Ok(())
     }

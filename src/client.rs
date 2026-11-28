@@ -96,14 +96,14 @@ fn detach(log: &Path) -> Result<bool, String> {
         return Ok(true);
     }
     let file = open_log(log)?;
-    let exe = std::env::current_exe().map_err(|e| format!("自分の実行ファイルの場所がわかりません: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own executable: {e}"))?;
     let mut cmd = Command::new(exe);
     cmd.args(std::env::args_os().skip(1))
         .env(DETACHED_ENV, "1")
         .stdin(Stdio::null())
         .stdout(file.try_clone().map_err(|e| format!("{}: {e}", log.display()))?)
         .stderr(file);
-    in_new_session(&mut cmd).spawn().map_err(|e| format!("裏での起動に失敗しました: {e}"))?;
+    in_new_session(&mut cmd).spawn().map_err(|e| format!("failed to start in the background: {e}"))?;
     Ok(false)
 }
 
@@ -161,7 +161,7 @@ fn say(text: &str) {
     let (ok, dropped) = SAY_LIMIT.lock().map_or((true, 0), |mut l| l.allow(Instant::now()));
     let mut err = io::stderr().lock();
     if dropped > 0 {
-        let _ = writeln!(err, "{} micmux: ログが多すぎるので {dropped} 行を省きました", clock());
+        let _ = writeln!(err, "{} micmux: too many log lines, {dropped} omitted", clock());
     }
     if ok {
         let _ = writeln!(err, "{} micmux: {text}", clock());
@@ -284,7 +284,7 @@ impl Client {
         // 録音中に届いた START で取得を始め直しても、連続録音時間は数え直さない。
         // 数え直すと、接続先が START を送り続けるだけで上限をすり抜けられる
         let since = self.capture.as_ref().map(|c| c.1);
-        self.end("切り替え");
+        self.end("restart");
         self.generation += 1;
         let generation = self.generation;
         let tx = self.tx.clone();
@@ -293,7 +293,7 @@ impl Client {
         });
         self.capture = Some((capture, since.unwrap_or_else(Instant::now), generation));
         self.sessions += 1;
-        say(&format!("● 録音中 → {} (session {session})", self.opts.host));
+        say(&format!("● recording → {} (session {session})", self.opts.host));
     }
 
     fn end(&mut self, why: &str) {
@@ -302,18 +302,18 @@ impl Client {
         let stats = capture.stop();
         let dropped = stats.dropped_samples.load(Ordering::Relaxed);
         say(&format!(
-            "○ 録音停止 ({why}; session {session}, {:.1}s, {} KB, 最初の音声まで {} ms, 最大音量 {}{})",
+            "○ stopped recording ({why}; session {session}, {:.1}s, {} KB, first audio after {} ms, peak {}{})",
             started.elapsed().as_secs_f32(),
             stats.bytes_sent.load(Ordering::Relaxed) / 1024,
             stats.first_audio_ms.load(Ordering::Relaxed),
             crate::capture::describe_peak(stats.peak.load(Ordering::Relaxed)),
-            if dropped > 0 { format!(", 取りこぼし {dropped} サンプル") } else { String::new() },
+            if dropped > 0 { format!(", dropped {dropped} samples") } else { String::new() },
         ));
     }
 
     fn deny(&mut self, session: u32) {
         let bell = if self.opts.bell { "\x07" } else { "" };
-        say(&format!("{bell}録音要求を断りました (disarmed)。許可するには Enter か `micmux arm`"));
+        say(&format!("{bell}denied a recording request (disarmed); press Enter or run `micmux arm` to allow"));
         let _ = self.send(&Msg::AudioEnd { session, reason: end_reason::DENIED });
     }
 
@@ -344,7 +344,7 @@ impl Client {
             format!(
                 "host={}{} armed={} requested={} recording={} sessions={} rtt={}",
                 self.opts.host,
-                if self.connected { "" } else { " (接続待ち)" },
+                if self.connected { "" } else { " (connecting)" },
                 self.armed,
                 self.requested.is_some(),
                 recording,
@@ -363,7 +363,7 @@ impl Client {
         match cmd {
             Cmd::Arm => {
                 self.armed = true;
-                say("armed: 録音要求を受け付けます");
+                say("armed: accepting recording requests");
                 if let (Some(session), None) = (self.requested, &self.capture) {
                     self.begin(session);
                 }
@@ -371,7 +371,7 @@ impl Client {
             Cmd::Disarm => {
                 self.armed = false;
                 self.end("disarm");
-                say("disarmed: 録音要求を断ります");
+                say("disarmed: denying recording requests");
             }
             Cmd::Status => return Some(self.status(false)),
             Cmd::StatusJson => return Some(self.status(true)),
@@ -403,14 +403,14 @@ impl Client {
 
     fn on_watch(&mut self, pid: i32, host: &str, reply: SyncSender<String>) {
         let text = if host != self.opts.host {
-            format!("error: {} に接続中のため {host} には使えません", self.opts.host)
+            format!("error: connected to {}, cannot be used for {host}", self.opts.host)
         } else {
             // --watch-pid 無しで起動された（端末から手で動かしている）なら、終了の条件にしない。
             // 相乗りしてきた ssh が終わっただけで、手で起動したものまで終わってしまわないように
             if self.opts.watch_pid.is_none() || self.watched.contains(&pid) {
                 "ok".into()
             } else if self.watched.len() >= MAX_WATCHED {
-                format!("error: 監視対象が多すぎます（{MAX_WATCHED} 件まで）")
+                format!("error: too many watched processes (max {MAX_WATCHED})")
             } else {
                 self.watched.push(pid);
                 "ok".into()
@@ -434,7 +434,7 @@ impl Client {
         let rest = match ev {
             Some(Event::Control(cmd, reply)) => {
                 if !self.on_control(cmd, reply) {
-                    self.end("終了");
+                    self.end("exit");
                     return Err(Done);
                 }
                 None
@@ -445,9 +445,9 @@ impl Client {
             }
             Some(Event::CaptureExit(generation, result)) => {
                 if self.capture.as_ref().is_some_and(|c| c.2 == generation) {
-                    self.end("取得が終了");
+                    self.end("capture ended");
                     if let Err(e) = result {
-                        say(&format!("マイクを取得できません: {e}"));
+                        say(&format!("cannot capture from the microphone: {e}"));
                     }
                 }
                 None
@@ -458,8 +458,8 @@ impl Client {
         if !self.watched.is_empty() {
             self.watched.retain(|&pid| alive(pid));
             if self.watched.is_empty() {
-                self.end("終了");
-                say("監視対象の ssh がすべて終了したので終わります");
+                self.end("exit");
+                say("all watched ssh processes have exited, exiting");
                 return Err(Done);
             }
         }
@@ -481,7 +481,7 @@ impl Client {
                     self.requested = None;
                 }
                 if self.capture.as_ref().is_some_and(|(c, ..)| c.session == session) {
-                    self.end("要求終了");
+                    self.end("request ended");
                 }
             }
             Msg::Pong { nonce } => {
@@ -491,9 +491,9 @@ impl Client {
                 let _ = self.send(&Msg::Pong { nonce });
             }
             Msg::Error { message } => {
-                say(&format!("bridge のエラー: {}", sanitize::line(&message, sanitize::MAX_LINE_CHARS)))
+                say(&format!("bridge error: {}", sanitize::line(&message, sanitize::MAX_LINE_CHARS)))
             }
-            other => say(&format!("想定外のメッセージ: {}", other.summary())),
+            other => say(&format!("unexpected message: {}", other.summary())),
         }
     }
 }
@@ -508,13 +508,13 @@ pub fn run(opts: Options) -> Result<(), String> {
     }
     if opts.background {
         let log = opts.log_path.clone().or_else(default_log_path).ok_or(
-            "ログの置き場所が決められません（XDG_STATE_HOME も HOME もありません）。--log で指定してください",
+            "cannot choose a log location (neither XDG_STATE_HOME nor HOME is set); use --log",
         )?;
         if !detach(&log)? {
             return Ok(());
         }
         say(&format!(
-            "起動 (version {}, pid {}, host {}, watch-pid {:?}, mux {}, 取得 {:?})",
+            "started (version {}, pid {}, host {}, watch-pid {:?}, mux {}, capture {:?})",
             env!("CARGO_PKG_VERSION"),
             std::process::id(),
             opts.host,
@@ -564,7 +564,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(120);
         while !ssh::master_up(&client.opts) {
             if Instant::now() >= deadline {
-                let e = "端末用の SSH 接続が 120 秒待っても確立しませんでした".to_string();
+                let e = "the terminal's SSH connection was not established within 120 seconds".to_string();
                 say(&e);
                 return Err(e);
             }
@@ -574,7 +574,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         }
     }
     let mut child = Transport(
-        ssh::spawn_transport(&client.opts).map_err(|e| format!("接続コマンドを起動できません: {e}"))?,
+        ssh::spawn_transport(&client.opts).map_err(|e| format!("cannot start the transport command: {e}"))?,
     );
     *client.writer.lock().unwrap() = Box::new(child.0.stdin.take().expect("piped stdin"));
     let mut from_bridge = child.0.stdout.take().expect("piped stdout");
@@ -594,7 +594,7 @@ pub fn run(opts: Options) -> Result<(), String> {
     }
 
     // ここから先で抜けると、child の drop で接続コマンドを止める
-    client.send(&Msg::Hello { version: VERSION }).map_err(|e| format!("bridge へ送信できません: {e}"))?;
+    client.send(&Msg::Hello { version: VERSION }).map_err(|e| format!("cannot send to bridge: {e}"))?;
     // 応答の無い接続先で待ち続けると、操作用ソケットを握ったまま残り、以後の ssh がすべて
     // ここに相乗りしてしまう。裏で動くときは BatchMode で尋ねられることも無いので短く切る。
     // 端末から動かすときはパスフレーズなどの入力を待つので長めにとる
@@ -602,14 +602,14 @@ pub fn run(opts: Options) -> Result<(), String> {
     let deadline = Instant::now() + limit;
     let source_name = loop {
         if Instant::now() >= deadline {
-            return Err(format!("bridge から {} 秒待っても応答がありません", limit.as_secs()));
+            return Err(format!("no response from bridge within {} seconds", limit.as_secs()));
         }
         match client.next(&rx, Duration::from_millis(500)) {
             Ok(Some(Event::Msg(Msg::HelloAck { version, source }))) if version == VERSION => {
                 break sanitize::line(&source, sanitize::MAX_LINE_CHARS);
             }
             Ok(Some(Event::Msg(Msg::HelloAck { version, .. }))) => {
-                return Err(format!("プロトコルのバージョンが違います (bridge {version}, client {VERSION})"));
+                return Err(format!("protocol version mismatch (bridge {version}, client {VERSION})"));
             }
             Ok(Some(Event::Msg(Msg::Error { message }))) => {
                 return Err(format!("bridge: {}", sanitize::line(&message, sanitize::MAX_LINE_CHARS)));
@@ -617,7 +617,7 @@ pub fn run(opts: Options) -> Result<(), String> {
             Ok(Some(Event::Closed(e))) => {
                 let detail = e.map(|e| format!(": {e}")).unwrap_or_default();
                 return Err(format!(
-                    "bridge を起動できませんでした{detail}\n  接続先に micmux が入っているか確認してください（PATH にない場合は --remote-cmd で場所を指定）"
+                    "failed to start bridge{detail}\n  check that micmux is installed on the remote host (if it is not on PATH, use --remote-cmd)"
                 ));
             }
             Ok(_) => {}
@@ -638,21 +638,21 @@ pub fn run(opts: Options) -> Result<(), String> {
                             break;
                         }
                     }
-                    None => eprintln!("micmux: Enter=切り替え  a=arm  d=disarm  s=status  q=終了"),
+                    None => eprintln!("micmux: Enter=toggle  a=arm  d=disarm  s=status  q=quit"),
                 }
             }
         });
     }
 
-    say(&format!("{} に接続しました。仮想マイク: {source_name}", client.opts.host));
+    say(&format!("connected to {}; virtual mic: {source_name}", client.opts.host));
     match &socket {
-        Ok(s) => say(&format!("操作用ソケット: {}", s.path.display())),
-        Err(e) => say(&format!("操作用ソケットは使えません: {e}")),
+        Ok(s) => say(&format!("control socket: {}", s.path.display())),
+        Err(e) => say(&format!("control socket unavailable: {e}")),
     }
     say(if client.armed {
-        "armed: 録音要求を受け付けます (Enter で切り替え、q で終了)"
+        "armed: accepting recording requests (Enter to toggle, q to quit)"
     } else {
-        "disarmed: 録音要求は断ります (Enter で許可、q で終了)"
+        "disarmed: denying recording requests (Enter to allow, q to quit)"
     });
 
     let started = Instant::now();
@@ -665,10 +665,10 @@ pub fn run(opts: Options) -> Result<(), String> {
         match ev {
             Some(Event::Msg(msg)) => client.on_msg(msg, started),
             Some(Event::Closed(e)) => {
-                client.end("切断");
+                client.end("disconnected");
                 break Err(match e {
-                    Some(e) => format!("bridge との通信に失敗しました: {e}"),
-                    None => "接続が切れました".into(),
+                    Some(e) => format!("communication with bridge failed: {e}"),
+                    None => "connection lost".into(),
                 });
             }
             _ => {}
@@ -679,9 +679,9 @@ pub fn run(opts: Options) -> Result<(), String> {
         if let (Some((_, since, _)), Some(max)) = (&client.capture, client.max) {
             if since.elapsed() >= max {
                 client.armed = false;
-                client.end("時間上限");
+                client.end("time limit");
                 say(&format!(
-                    "連続録音時間の上限 ({} 秒) に達したので disarm しました。続けるには `micmux arm`",
+                    "reached the recording limit ({} s), disarmed; run `micmux arm` to continue",
                     max.as_secs()
                 ));
             }

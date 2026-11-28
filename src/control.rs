@@ -84,7 +84,7 @@ fn login_name() -> Option<String> {
 pub fn send_control(cmd: &str) -> Result<String, String> {
     let path = control_path();
     let mut s = UnixStream::connect(&path)
-        .map_err(|e| format!("micmux connect が動いていません ({}: {e})", path.display()))?;
+        .map_err(|e| format!("micmux connect is not running ({}: {e})", path.display()))?;
     s.set_read_timeout(Some(Duration::from_secs(3))).ok();
     writeln!(s, "{cmd}").map_err(|e| e.to_string())?;
     let mut reply = String::new();
@@ -157,13 +157,13 @@ pub fn listen(tx: Sender<Event>) -> Result<SocketFile, String> {
     if path.exists() {
         // 排他を使わない古い版の micmux が動いている場合
         if another_instance_running() {
-            return Err(format!("別の micmux connect が動いています ({})", path.display()));
+            return Err(format!("another micmux connect is running ({})", path.display()));
         }
         let _ = std::fs::remove_file(&path); // 前回の残骸
     }
     let listener = UnixListener::bind(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    let id = socket_id(&path).ok_or_else(|| format!("{} を作れませんでした", path.display()))?;
+    let id = socket_id(&path).ok_or_else(|| format!("failed to create {}", path.display()))?;
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { continue };
@@ -177,7 +177,7 @@ pub fn listen(tx: Sender<Event>) -> Result<SocketFile, String> {
             let mut words = line.split_whitespace();
             let event = match (words.next(), words.next().and_then(|p| p.parse().ok()), words.next()) {
                 (Some("watch"), Some(pid), Some(_)) if !valid_watch_pid(pid) => {
-                    Err(format!("error: pid {pid} は監視できません"))
+                    Err(format!("error: cannot watch pid {pid}"))
                 }
                 (Some("watch"), Some(pid), Some(host)) => {
                     Ok(Event::Watch { pid, host: host.to_string(), reply: rtx })
@@ -214,7 +214,7 @@ pub fn valid_watch_pid(pid: i32) -> bool {
 /// 動いている micmux に、この ssh が生きているあいだも動き続けるよう登録する。
 pub fn join_running_instance(opts: &Options) -> Result<(), String> {
     let Some(pid) = opts.watch_pid else {
-        return Err(format!("別の micmux connect が動いています ({})", control_path().display()));
+        return Err(format!("another micmux connect is running ({})", control_path().display()));
     };
     let reply = send_control(&format!("watch {pid} {}", opts.host))?;
     if reply != "ok" {
@@ -232,7 +232,7 @@ pub fn join_when_ready(opts: &Options) -> Result<(), String> {
     while !another_instance_running() {
         if Instant::now() >= deadline {
             return Err(format!(
-                "別の micmux connect が起動中ですが、操作用ソケットが開きません ({})",
+                "another micmux connect is starting, but its control socket did not open ({})",
                 control_path().display()
             ));
         }

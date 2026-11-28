@@ -119,13 +119,13 @@ impl Relay {
                 if self.total + out.len() >= RELAY_TOTAL_MAX {
                     if !self.closed {
                         self.closed = true;
-                        out.push_str("micmux: 接続先の出力が多すぎるので、以降は表示しません\n");
+                        out.push_str("micmux: too much output from the remote host, hiding the rest\n");
                     }
                     self.skipping = true;
                 } else {
                     let (ok, dropped) = self.limit.allow(now);
                     if dropped > 0 {
-                        out.push_str(&format!("micmux: 接続先の出力が多すぎるので {dropped} 行を省きました\n"));
+                        out.push_str(&format!("micmux: too much output from the remote host, {dropped} lines omitted\n"));
                     }
                     self.skipping = !ok;
                 }
@@ -225,7 +225,7 @@ mod tests {
         let out = r.feed("l\n".repeat(100).as_bytes(), t);
         assert_eq!(out.lines().count(), 60);
         let out = r.feed(b"next\n", t + Duration::from_secs(61));
-        assert_eq!(out, "micmux: 接続先の出力が多すぎるので 40 行を省きました\nnext\n");
+        assert_eq!(out, "micmux: too much output from the remote host, 40 lines omitted\nnext\n");
 
         // 総量の上限を超えたら、行数に余裕があっても以降は出さない
         let mut r = Relay::default();

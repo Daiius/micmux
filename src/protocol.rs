@@ -138,7 +138,7 @@ impl Msg {
             Msg::Pong { .. } => "Pong",
             Msg::Error { .. } => "Error",
         };
-        format!("{name} ({} バイト)", self.encode().len() - 5)
+        format!("{name} ({} bytes)", self.encode().len() - 5)
     }
 
     fn decode(ty: u8, p: &[u8]) -> io::Result<Msg> {
@@ -154,7 +154,7 @@ impl Msg {
         };
         let hello = || -> io::Result<u16> {
             if p.len() < 6 || p[..4] != MAGIC {
-                return Err(invalid("bad magic (stdout に余計な出力が混ざっていないか確認)"));
+                return Err(invalid("bad magic (check for stray output on stdout)"));
             }
             Ok(u16::from_le_bytes([p[4], p[5]]))
         };
@@ -272,9 +272,9 @@ mod tests {
     #[test]
     fn summary_omits_contents() {
         let m = Msg::Audio { session: 1, pcm: vec![0xAB; 60_000] };
-        assert_eq!(m.summary(), "Audio (60004 バイト)");
+        assert_eq!(m.summary(), "Audio (60004 bytes)");
         let e = Msg::Error { message: "\x1b]0;x\x07".into() };
-        assert_eq!(e.summary(), "Error (6 バイト)");
+        assert_eq!(e.summary(), "Error (6 bytes)");
     }
 
     #[test]

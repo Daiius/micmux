@@ -71,10 +71,10 @@ fn pactl(args: &[&str]) -> Result<String, String> {
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("pactl を実行できません ({e})。pulseaudio-utils を入れてください"))?;
+        .map_err(|e| format!("cannot run pactl ({e}); install pulseaudio-utils"))?;
     if !out.status.success() {
         return Err(format!(
-            "pactl {} が失敗: {}",
+            "pactl {} failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         ));
@@ -150,7 +150,7 @@ impl VirtualMic {
 
     fn setup(opts: &Options) -> Result<VirtualMic, String> {
         pactl(&["info"]).map_err(|e| {
-            format!("サウンドサーバーに接続できません。PulseAudio か pipewire-pulse が動いているか確認してください ({e})")
+            format!("cannot connect to the sound server; check that PulseAudio or pipewire-pulse is running ({e})")
         })?;
         let sink = opts.sink_name.clone();
         let mut mic = VirtualMic {
@@ -167,12 +167,12 @@ impl VirtualMic {
             Ok(Some(d)) if d == PLACEHOLDER_SINK => mic.keep_out_of_default_sink(Some(d)),
             Ok(Some(_)) => {}
             Err(e) => log!(
-                "micmux bridge: 既定の出力先を確かめられないので、変更しません。接続先で鳴った音が仮想マイクに混ざりえます: {e}"
+                "micmux bridge: cannot check the default sink, leaving it unchanged; sounds played on this host may leak into the virtual mic: {e}"
             ),
         }
         let module = (|| -> Result<Option<String>, String> {
             if find_index("sinks", &sink)?.is_some() {
-                log!("micmux bridge: 既存の sink '{sink}' を使います");
+                log!("micmux bridge: using existing sink '{sink}'");
                 return Ok(None);
             }
             let id = pactl(&[
@@ -199,14 +199,14 @@ impl VirtualMic {
             Ok(Some(i)) => mic.source_index = i,
             other => {
                 mic.teardown();
-                return Err(format!("source '{}' が見つかりません ({other:?})", mic.source_name()));
+                return Err(format!("source '{}' not found ({other:?})", mic.source_name()));
             }
         }
         if opts.set_default {
             let prev = pactl(&["get-default-source"]).map(|s| s.trim().to_string()).ok();
             if prev.as_deref() != Some(&mic.source_name()) {
                 if let Err(e) = pactl(&["set-default-source", &mic.source_name()]) {
-                    log!("micmux bridge: 既定 source を変更できません: {e}");
+                    log!("micmux bridge: cannot change the default source: {e}");
                 } else {
                     mic.prev_default = prev;
                 }
@@ -247,7 +247,7 @@ impl VirtualMic {
             ]) {
                 Ok(id) => self.discard_module = Some(id.trim().to_string()),
                 Err(e) => {
-                    log!("micmux bridge: 出力の捨て先を作れません。接続先で鳴った音が仮想マイクに混ざりえます: {e}");
+                    log!("micmux bridge: cannot create the discard sink; sounds played on this host may leak into the virtual mic: {e}");
                     return;
                 }
             }
@@ -259,9 +259,9 @@ impl VirtualMic {
                     self.prev_default_sink =
                         prev.filter(|p| p != PLACEHOLDER_SINK && *p != self.sink && *p != discard);
                 }
-                log!("micmux bridge: 既定の出力先を '{discard}' にしました（仮想マイクへの混入を防ぐため）");
+                log!("micmux bridge: set the default sink to '{discard}' to keep other sounds out of the virtual mic");
             }
-            Err(e) => log!("micmux bridge: 既定の出力先を変更できません。接続先で鳴った音が仮想マイクに混ざりえます: {e}"),
+            Err(e) => log!("micmux bridge: cannot change the default sink; sounds played on this host may leak into the virtual mic: {e}"),
         }
     }
 
@@ -419,7 +419,7 @@ fn take_over(sink: &str) -> Option<std::fs::File> {
     {
         Ok(f) => f,
         Err(e) => {
-            log!("micmux bridge: {} を開けないので、前の bridge の確認を省きます: {e}", path.display());
+            log!("micmux bridge: cannot open {}, skipping the check for a previous bridge: {e}", path.display());
             return None;
         }
     };
@@ -440,16 +440,16 @@ fn take_over(sink: &str) -> Option<std::fs::File> {
         let pid = if ok && fl.l_type != libc::F_UNLCK as _ { fl.l_pid } else { 0 };
         let waited = started.elapsed();
         if pid > 0 && !termed {
-            log!("micmux bridge: 前の bridge (pid {pid}) を終わらせます");
+            log!("micmux bridge: stopping the previous bridge (pid {pid})");
             unsafe { libc::kill(pid, libc::SIGTERM) };
             termed = true;
         } else if pid > 0 && !killed && waited >= Duration::from_secs(3) {
             // 書き込みで止まっているなどで終われない。後片付けは残るが、壊されるよりよい
-            log!("micmux bridge: 前の bridge (pid {pid}) が終わらないので強制終了します");
+            log!("micmux bridge: previous bridge (pid {pid}) did not exit, killing it");
             unsafe { libc::kill(pid, libc::SIGKILL) };
             killed = true;
         } else if waited >= Duration::from_secs(6) {
-            log!("micmux bridge: 前の bridge の終了を確認できないまま続けます");
+            log!("micmux bridge: continuing without confirming that the previous bridge exited");
             return None;
         }
         thread::sleep(Duration::from_millis(100));
@@ -469,13 +469,13 @@ pub fn run(opts: Options) -> Result<(), String> {
     match rx.recv_timeout(Duration::from_secs(10)) {
         Ok(Event::Msg(Msg::Hello { version })) if version == VERSION => {}
         Ok(Event::Msg(Msg::Hello { version })) => {
-            let message = format!("プロトコルのバージョンが違います (client {version}, bridge {VERSION})");
+            let message = format!("protocol version mismatch (client {version}, bridge {VERSION})");
             let _ = send(&Msg::Error { message: message.clone() });
             return Err(message);
         }
-        Ok(Event::Closed(e)) => return Err(format!("HELLO の前に切断されました ({e:?})")),
-        Ok(_) => return Err("最初のメッセージが HELLO ではありません".into()),
-        Err(_) => return Err("HELLO を受信できませんでした".into()),
+        Ok(Event::Closed(e)) => return Err(format!("disconnected before HELLO ({e:?})")),
+        Ok(_) => return Err("first message was not HELLO".into()),
+        Err(_) => return Err("no HELLO received".into()),
     }
 
     let _exclusive = take_over(&opts.sink_name);
@@ -490,7 +490,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         Ok(w) => w,
         Err(e) => {
             mic.teardown();
-            return Err(format!("pactl subscribe を起動できません: {e}"));
+            return Err(format!("cannot start pactl subscribe: {e}"));
         }
     };
 
@@ -504,9 +504,9 @@ pub fn run(opts: Options) -> Result<(), String> {
 
 /// 録音中の pacat (`playback`) はこの関数のローカルなので、どの経路で抜けても drop で止まる。
 fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(), String> {
-    let io_err = |e: io::Error| format!("client への送信に失敗: {e}");
+    let io_err = |e: io::Error| format!("failed to send to client: {e}");
     send(&Msg::HelloAck { version: VERSION, source: mic.source_name() }).map_err(io_err)?;
-    log!("micmux bridge: 仮想マイク '{}' を用意しました", mic.source_name());
+    log!("micmux bridge: virtual mic '{}' is ready", mic.source_name());
 
     let mut next_session: u32 = 0;
     // 現在の録音セッションと、その START を送った時刻
@@ -532,7 +532,7 @@ fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(
                     next_session = next_session.wrapping_add(1);
                     active = Some((next_session, Instant::now()));
                     first_audio_logged = false;
-                    log!("micmux bridge: 録音要求 → START (session {next_session})");
+                    log!("micmux bridge: recording requested → START (session {next_session})");
                     send(&Msg::Start { session: next_session }).map_err(io_err)?;
                 }
             } else if active.is_some() && stop_at.is_none() {
@@ -547,7 +547,7 @@ fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(
                 if let Some((session, started)) = active.take() {
                     let bytes = playback.take().map_or(0, |p| p.bytes);
                     log!(
-                        "micmux bridge: 録音終了 → STOP (session {session}, {:.1}s, 受信 {bytes} bytes)",
+                        "micmux bridge: recording ended → STOP (session {session}, {:.1}s, received {bytes} bytes)",
                         started.elapsed().as_secs_f32()
                     );
                     send(&Msg::Stop { session }).map_err(io_err)?;
@@ -556,12 +556,12 @@ fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(
             }
         }
         if TERMINATE.load(Ordering::SeqCst) {
-            log!("micmux bridge: 終了シグナルを受けました");
+            log!("micmux bridge: received a termination signal");
             return Ok(());
         }
         if now.duration_since(last_rx) >= opts.idle_timeout {
             log!(
-                "micmux bridge: client から {} 分間何も届かないので終わります",
+                "micmux bridge: nothing received from client for {} minutes, exiting",
                 opts.idle_timeout.as_secs() / 60
             );
             return Ok(());
@@ -586,28 +586,28 @@ fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(
             Event::PulseChanged => check_demand = true,
             Event::DefaultsChanged => mic.guard_default_sink(),
             Event::PulseGone => {
-                let message = "サウンドサーバーとの接続が切れました".to_string();
+                let message = "lost connection to the sound server".to_string();
                 let _ = send(&Msg::Error { message: message.clone() });
                 return Err(message);
             }
             Event::Closed(None) => {
-                log!("micmux bridge: client が切断しました");
+                log!("micmux bridge: client disconnected");
                 return Ok(());
             }
-            Event::Closed(Some(e)) => return Err(format!("client からの受信に失敗: {e}")),
+            Event::Closed(Some(e)) => return Err(format!("failed to receive from client: {e}")),
             Event::Msg(msg) => match msg {
                 Msg::AudioBegin { session, rate, channels } => {
                     if active.map(|a| a.0) != Some(session) {
                         continue; // 終わったセッション宛て
                     }
                     if !(8_000..=192_000).contains(&rate) || !(1..=2).contains(&channels) {
-                        log!("micmux bridge: 扱えない音声形式 ({rate} Hz, {channels} ch)");
+                        log!("micmux bridge: unsupported audio format ({rate} Hz, {channels} ch)");
                         continue;
                     }
                     playback = None; // 前の pacat を止めてから起動し直す
                     match Playback::start(&mic.sink, rate, channels, opts.latency_ms) {
                         Ok(p) => playback = Some(p),
-                        Err(e) => log!("micmux bridge: pacat を起動できません: {e}"),
+                        Err(e) => log!("micmux bridge: cannot start pacat: {e}"),
                     }
                 }
                 Msg::Audio { session, pcm } => {
@@ -619,12 +619,12 @@ fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(
                         if !first_audio_logged {
                             first_audio_logged = true;
                             log!(
-                                "micmux bridge: session {session}: START から最初の音声まで {} ms",
+                                "micmux bridge: session {session}: first audio {} ms after START",
                                 started.elapsed().as_millis()
                             );
                         }
                         if let Err(e) = p.write(&pcm) {
-                            log!("micmux bridge: 仮想マイクへの書き込みに失敗: {e}");
+                            log!("micmux bridge: failed to write to the virtual mic: {e}");
                             playback = None;
                         }
                     }
@@ -633,13 +633,13 @@ fn serve(opts: &Options, mic: &mut VirtualMic, rx: &Receiver<Event>) -> Result<(
                     if active.map(|a| a.0) == Some(session) {
                         playback = None;
                         if reason != end_reason::STOPPED {
-                            log!("micmux bridge: session {session}: client が音声を送りません (reason {reason})");
+                            log!("micmux bridge: session {session}: client is not sending audio (reason {reason})");
                         }
                     }
                 }
                 Msg::Ping { nonce } => send(&Msg::Pong { nonce }).map_err(io_err)?,
-                Msg::Error { message } => log!("micmux bridge: client からのエラー: {message}"),
-                other => log!("micmux bridge: 想定外のメッセージ: {other:?}"),
+                Msg::Error { message } => log!("micmux bridge: error from client: {message}"),
+                other => log!("micmux bridge: unexpected message: {other:?}"),
             },
         }
     }

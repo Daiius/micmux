@@ -41,7 +41,7 @@ pub struct Stats {
 /// 最大振幅を人が読める形にする。
 pub fn describe_peak(peak: u64) -> String {
     if peak == 0 {
-        return "0 (完全な無音。マイクの許可が下りていない可能性)".into();
+        return "0 (complete silence; microphone access may not be granted)".into();
     }
     format!("{:.0} dBFS", 20.0 * (peak as f64 / 32768.0).log10())
 }
@@ -81,10 +81,10 @@ pub fn mic_test(source: &Source, duration: std::time::Duration) -> Result<String
         }
     }
     if rate == 0 || samples == 0 {
-        return Err("音声が 1 サンプルも取れませんでした".into());
+        return Err("no audio samples captured".into());
     }
     Ok(format!(
-        "{rate} Hz で {:.2} 秒ぶん取得、最初の音声まで {} ms、最大音量 {}",
+        "captured {:.2} s at {rate} Hz, first audio after {} ms, peak {}",
         samples as f64 / rate as f64,
         stats.first_audio_ms.load(Ordering::Relaxed),
         describe_peak(stats.peak.load(Ordering::Relaxed)),
@@ -198,7 +198,7 @@ impl Ctx {
             .max()
             .unwrap_or(0);
         self.stats.peak.fetch_max(peak, Ordering::Relaxed);
-        self.send(&Msg::Audio { session: self.session, pcm }).map_err(|e| format!("送信に失敗: {e}"))
+        self.send(&Msg::Audio { session: self.session, pcm }).map_err(|e| format!("send failed: {e}"))
     }
 }
 
@@ -209,7 +209,7 @@ fn run_command(ctx: &Ctx, cmd: &str, rate: u32) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| format!("取得コマンドを起動できません: {e}"))?;
+        .map_err(|e| format!("cannot start the capture command: {e}"))?;
     let mut out = child.stdout.take().expect("piped stdout");
     *ctx.child.lock().unwrap() = Some(child);
     if ctx.stopped() {
@@ -219,7 +219,7 @@ fn run_command(ctx: &Ctx, cmd: &str, rate: u32) -> Result<(), String> {
     }
 
     ctx.send(&Msg::AudioBegin { session: ctx.session, rate, channels: 1 })
-        .map_err(|e| format!("送信に失敗: {e}"))?;
+        .map_err(|e| format!("send failed: {e}"))?;
     let frame_bytes = (rate * FRAME_MS / 1000) as usize * 2;
     let mut buf = vec![0u8; frame_bytes];
     let mut filled = 0;
@@ -228,7 +228,7 @@ fn run_command(ctx: &Ctx, cmd: &str, rate: u32) -> Result<(), String> {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("取得コマンドの出力を読めません: {e}")),
+            Err(e) => return Err(format!("cannot read the capture command output: {e}")),
         }
         if filled == frame_bytes {
             ctx.send_bytes(buf.clone())?;
@@ -246,8 +246,8 @@ fn run_command(ctx: &Ctx, cmd: &str, rate: u32) -> Result<(), String> {
     }
     match status {
         Some(Ok(s)) if s.success() => Ok(()),
-        Some(Ok(s)) => Err(format!("取得コマンドが終了しました ({s})")),
-        _ => Err("取得コマンドが終了しました".into()),
+        Some(Ok(s)) => Err(format!("capture command exited ({s})")),
+        _ => Err("capture command exited".into()),
     }
 }
 
@@ -271,7 +271,7 @@ fn reap(ctx: &Ctx, mut child: Child) -> io::Result<std::process::ExitStatus> {
 
 #[cfg(not(any(target_os = "macos", feature = "native")))]
 fn run_native(_ctx: &Ctx) -> Result<(), String> {
-    Err("このビルドには内蔵のマイク取得が入っていません。--capture-cmd を指定するか、--features native でビルドしてください".into())
+    Err("this build has no built-in capture; use --capture-cmd or build with --features native".into())
 }
 
 #[cfg(any(target_os = "macos", feature = "native"))]
@@ -310,7 +310,7 @@ fn run_native(ctx: &Ctx) -> Result<(), String> {
                     stats.dropped_samples.fetch_add(n, Ordering::Relaxed);
                 }
             },
-            |e| eprintln!("micmux: 入力ストリームのエラー: {e}"),
+            |e| eprintln!("micmux: input stream error: {e}"),
             None,
         )
     }
@@ -318,10 +318,10 @@ fn run_native(ctx: &Ctx) -> Result<(), String> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
-        .ok_or("入力デバイスがありません（マイクのアクセス権限も確認してください）")?;
+        .ok_or("no input device (also check microphone access)")?;
     let supported = device
         .default_input_config()
-        .map_err(|e| format!("入力デバイスの設定を取得できません: {e}"))?;
+        .map_err(|e| format!("cannot get the input device config: {e}"))?;
     let in_rate = supported.sample_rate().0;
     let config: cpal::StreamConfig = supported.config();
 
@@ -332,15 +332,15 @@ fn run_native(ctx: &Ctx) -> Result<(), String> {
         cpal::SampleFormat::I16 => build::<i16>(&device, &config, tx, ctx.stats.clone()),
         cpal::SampleFormat::U16 => build::<u16>(&device, &config, tx, ctx.stats.clone()),
         cpal::SampleFormat::I32 => build::<i32>(&device, &config, tx, ctx.stats.clone()),
-        other => return Err(format!("未対応のサンプル形式です: {other:?}")),
+        other => return Err(format!("unsupported sample format: {other:?}")),
     }
-    .map_err(|e| format!("入力ストリームを開けません: {e}"))?;
-    stream.play().map_err(|e| format!("入力ストリームを開始できません: {e}"))?;
+    .map_err(|e| format!("cannot open the input stream: {e}"))?;
+    stream.play().map_err(|e| format!("cannot start the input stream: {e}"))?;
 
     let mut decimator = Decimator::for_rate(in_rate);
     let out_rate = decimator.out_rate(in_rate);
     ctx.send(&Msg::AudioBegin { session: ctx.session, rate: out_rate, channels: 1 })
-        .map_err(|e| format!("送信に失敗: {e}"))?;
+        .map_err(|e| format!("send failed: {e}"))?;
 
     let frame = (out_rate * FRAME_MS / 1000) as usize;
     let mut pending: Vec<i16> = Vec::with_capacity(frame * 4);
@@ -354,7 +354,7 @@ fn run_native(ctx: &Ctx) -> Result<(), String> {
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Err("入力ストリームが終了しました".into()),
+            Err(RecvTimeoutError::Disconnected) => return Err("input stream ended".into()),
         }
     }
     drop(stream); // ここでデバイスが閉じる
