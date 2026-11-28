@@ -201,6 +201,39 @@ impl VirtualMic {
         self.default_mic.as_ref().map(|d| (format!("{}:monitor_MONO", self.sink), format!("{}:input_MONO", d.name)))
     }
 
+    /// 録音セッションで張るリンクが、実際に張れることを起動時に確かめる。張れなければ、独立した source を
+    /// やめて、monitor を既定にする動作に戻す。
+    ///
+    /// `pw-link` があっても、つなげるとは限らない。`pw-link` は `pactl` とは別の経路で音声サーバーに繋がるので、
+    /// 片方だけが別の音声サーバーを指している環境では、ポートが見つからない。
+    fn check_session_link(&mut self) {
+        let Some((from, to)) = self.session_link() else { return };
+        // 前の bridge が後片付けをせずに終わっていると、リンクが残っている。残っていると、仮想マイクが
+        // 休止できず、待機中も CPU を使う。先に外す（無ければ失敗するが、構わない）
+        let _ = pw_link(&["-d", "--", &from, &to]);
+        // 作った直後は、ポートがまだ見えないことがある。少し待って試す
+        let mut result = pw_link(&["--", &from, &to]);
+        for _ in 0..10 {
+            if result.is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+            result = pw_link(&["--", &from, &to]);
+        }
+        match result {
+            // 張ったままにしない。録音のたびに張り直す
+            Ok(()) => {
+                let _ = pw_link(&["-d", "--", &from, &to]);
+            }
+            Err(e) => {
+                log!("micmux bridge: cannot link the virtual mic to a separate source, using the sink monitor as the default device: {e}");
+                if let Some(id) = self.default_mic.take().and_then(|d| d.module) {
+                    let _ = pactl(&["unload-module", &id]);
+                }
+            }
+        }
+    }
+
     /// PipeWire で、既定の録音デバイスにするための source を作る。作れなければ `None`（monitor を既定にする）。
     fn create_default_mic(&self) -> Option<DefaultMic> {
         let name = format!("{}_mic", self.sink);
@@ -307,11 +340,7 @@ impl VirtualMic {
                     Ok(()) => mic.default_mic = mic.create_default_mic(),
                     Err(e) => log!("micmux bridge: pw-link is not usable, using the sink monitor as the default device: {e}"),
                 }
-                // 前の bridge が後片付けをせずに終わっていると、リンクが残っている。残っていると、仮想マイクが
-                // 休止できず、待機中も CPU を使う。次の録音で張り直すので、ここで外す（無ければ失敗するが、構わない）
-                if let Some((from, to)) = mic.session_link() {
-                    let _ = pw_link(&["-d", "--", &from, &to]);
-                }
+                mic.check_session_link();
             }
             if prev.as_deref() != Some(&mic.source_name()) {
                 if let Err(e) = pactl(&["set-default-source", &mic.source_name()]) {

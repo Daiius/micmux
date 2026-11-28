@@ -59,6 +59,7 @@ cleanup() {
     echo "---- client.log"; cat "$W/client.log" 2>/dev/null || true
     echo "---- client4.log"; cat "$W/client4.log" 2>/dev/null || true
     echo "---- client5.log"; cat "$W/client5.log" 2>/dev/null || true
+    echo "---- client6.log"; cat "$W/client6.log" 2>/dev/null || true
     echo "---- pulse.log";  tail -n 20 "$W/pulse.log" 2>/dev/null || true
     echo "---- pipewire.log"; tail -n 20 "$W/pipewire.log" "$W/wireplumber.log" 2>/dev/null || true
   fi
@@ -98,7 +99,7 @@ status_has() { "$BIN" status 2>/dev/null | grep -q "$1"; }
 sink_exists() { pactl list short sinks | cut -f2 | grep -qx "$1"; }
 # アプリが録音に使うデバイスの名前。音声サーバーで違うので、client のログから読む
 # （PulseAudio では <名前>.monitor、PipeWire では <名前>）
-vmic_of() { sed -n 's/.*virtual mic: //p' "$1" | head -n 1; }
+vmic_of() { sed -n 's/.*connected to .*; virtual mic: //p' "$1" | head -n 1; }
 
 echo "== start a dedicated sound server"
 # D-Bus を切り離さないと、利用者の音声サーバーと名前が衝突して起動しない
@@ -419,6 +420,32 @@ if [ "$SERVER" = pipewire ]; then
   pactl unload-module "$LEFT_MIC"
   pactl unload-module "$LEFT_SINK"
   ok "leftover link"
+
+  echo "== when links cannot be made, the sink monitor becomes the default device"
+  # pw-link はあるが、つなげない環境の代わり（pactl と pw-link の繋ぎ先がずれている、など）。
+  # 独立した source を既定にしても音を渡せないので、作らずに、monitor を既定にする
+  mkdir -p "$W/fakebin2"
+  cat >"$W/fakebin2/pw-link" <<'SH'
+#!/bin/sh
+[ "$1" = --version ] && exit 0
+echo "pw-link: cannot connect (fake)" >&2
+exit 1
+SH
+  chmod +x "$W/fakebin2/pw-link"
+  MICMUX_SOCKET="$W/sixth.sock" PATH="$W/fakebin2:$PATH" "$BIN" connect \
+    --transport "$BIN bridge --sink-name e2e6 --set-default" --capture-cmd "cat /dev/zero" </dev/null >"$W/client6.log" 2>&1 &
+  CLIENT6=$!
+  PIDS+=("$CLIENT6")
+  wait_for 15 grep -q 'connected to' "$W/client6.log" || fail "sixth client did not connect"
+  [ "$(vmic_of "$W/client6.log")" = e2e6.monitor ] || fail "expected the sink monitor, got $(vmic_of "$W/client6.log")"
+  [ "$(pactl get-default-source)" = e2e6.monitor ] || fail "the default source is $(pactl get-default-source), not the sink monitor"
+  ! source_exists e2e6_mic || fail "the separate source was left behind although it cannot be linked"
+  grep -q 'cannot link the virtual mic' "$W/client6.log" || fail "no log about the failed link"
+  kill "$CLIENT6"
+  wait "$CLIENT6" 2>/dev/null || true
+  gone6() { ! sink_exists e2e6; }
+  wait_for 5 gone6 || fail "sixth virtual mic was left behind"
+  ok "fallback when links cannot be made"
 fi
 
 echo "== info: time from recording request to first audio"
