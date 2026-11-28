@@ -77,6 +77,35 @@ jobs:
       - name: End-to-end (native capture)
         run: E2E_NATIVE=1 ./scripts/e2e-linux.sh target/debug/micmux
 
+  # 同じ試験を PipeWire（pipewire-pulse + WirePlumber）で回す。最近のデスクトップ向けの
+  # ディストリビューションは、こちらが既定になっている。
+  # ALSA のプラグインが既定デバイスを取り合うので、PulseAudio のジョブとは分ける
+  e2e-pipewire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          cargo --version
+      # pipewire-alsa: ALSA から PipeWire へ繋ぐプラグイン（内蔵の取得が通る経路）
+      - name: Install PipeWire and ALSA
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pipewire pipewire-pulse wireplumber pipewire-alsa pulseaudio-utils libasound2-dev
+          pipewire --version
+      - name: Build (native feature)
+        run: cargo build --locked --features native
+      - name: End-to-end (capture command)
+        run: E2E_SERVER=pipewire ./scripts/e2e-linux.sh target/debug/micmux
+      - name: End-to-end (native capture)
+        run: E2E_SERVER=pipewire E2E_NATIVE=1 ./scripts/e2e-linux.sh target/debug/micmux
+
   # Cargo.toml の rust-version でビルドできることを確かめる
   msrv:
     runs-on: ubuntu-latest
