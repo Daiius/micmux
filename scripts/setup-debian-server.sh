@@ -30,22 +30,22 @@ missing_packages() {
 
 show_status() {
   local p
-  echo "== パッケージ"
+  echo "== packages"
   for p in "${PACKAGES[@]}" pipewire-pulse alsa-utils; do
-    if installed "$p"; then echo "  [入っている] $p"; else echo "  [無い]       $p"; fi
+    if installed "$p"; then echo "  [installed] $p"; else echo "  [missing]   $p"; fi
   done
-  echo "== サウンドサーバー"
+  echo "== sound server"
   if command -v pactl >/dev/null && pactl info >/dev/null 2>&1; then
     LC_ALL=C pactl info | grep -E '^(Server Name|Default Source):' | sed 's/^/  /'
   else
-    echo "  接続できません"
+    echo "  cannot connect"
   fi
-  echo "== ログアウト後もユーザーサービスを動かす設定 (linger)"
-  echo "  $(loginctl show-user "$USER" 2>/dev/null | grep -i '^Linger=' || echo 'Linger=不明')"
-  echo "== サウンドカード (/proc/asound/cards)"
-  sed 's/^/  /' /proc/asound/cards 2>/dev/null || echo "  読めません"
+  echo "== keep user services running after logout (linger)"
+  echo "  $(loginctl show-user "$USER" 2>/dev/null | grep -i '^Linger=' || echo 'Linger=unknown')"
+  echo "== sound cards (/proc/asound/cards)"
+  sed 's/^/  /' /proc/asound/cards 2>/dev/null || echo "  cannot read"
   if [ -f "$STATE_FILE" ]; then
-    echo "== このスクリプトが入れたパッケージ"
+    echo "== packages installed by this script"
     sed 's/^/  /' "$STATE_FILE"
   fi
 }
@@ -65,20 +65,20 @@ case "$MODE" in
     show_status
     echo
     if command -v pactl >/dev/null && LC_ALL=C pactl info 2>/dev/null | grep -q 'PipeWire'; then
-      echo "PipeWire が動いています。PulseAudio は入れません。"
-      echo "ALSA で録音するアプリのために pipewire-alsa が入っているかだけ確認してください。"
+      echo "PipeWire is running, so PulseAudio will not be installed"
+      echo "make sure pipewire-alsa is installed for apps that record via ALSA"
       exit 0
     fi
     mapfile -t todo < <(missing_packages)
     if [ "${#todo[@]}" -gt 0 ]; then
-      echo "これから入れるパッケージ: ${todo[*]}"
-      confirm "sudo apt-get install を実行しますか?" || { echo "中止しました"; exit 1; }
+      echo "packages to install: ${todo[*]}"
+      confirm "run sudo apt-get install?" || { echo "aborted"; exit 1; }
       sudo apt-get install -y --no-install-recommends -- "${todo[@]}"
       mkdir -p "$(dirname "$STATE_FILE")"
       printf '%s\n' "${todo[@]}" >> "$STATE_FILE"
       sort -u -o "$STATE_FILE" "$STATE_FILE"
     else
-      echo "必要なパッケージは揃っています"
+      echo "all required packages are installed"
     fi
     # ソケット起動にしておけば、最初に使われたときだけサーバーが立ち上がる
     systemctl --user daemon-reload
@@ -86,13 +86,13 @@ case "$MODE" in
     echo
     show_status
     echo
-    echo "完了。micmux doctor で点検できます。"
-    echo "元に戻すには: $0 --remove"
+    echo "done; run micmux doctor to check the setup"
+    echo "to undo: $0 --remove"
     ;;
 
   --remove)
     if [ ! -s "$STATE_FILE" ]; then
-      echo "このスクリプトが入れたパッケージの記録がありません ($STATE_FILE)"
+      echo "no record of packages installed by this script ($STATE_FILE)"
       exit 0
     fi
     # 記録の各行は sudo apt-get の引数になる。書き換えられていても、このスクリプトが入れうる
@@ -104,29 +104,34 @@ case "$MODE" in
       done
     done < "$STATE_FILE"
     if [ "${#todo[@]}" -eq 0 ]; then
-      echo "記録 ($STATE_FILE) に、このスクリプトが入れるパッケージがありません"
+      echo "the record ($STATE_FILE) lists no packages this script installs"
       exit 0
     fi
-    echo "このスクリプトが入れたパッケージ: ${todo[*]}"
+    echo "packages installed by this script: ${todo[*]}"
     # apt-get remove はこれらに依存するパッケージも一緒に消す。記録だけを見せて確認すると、
     # 利用者の知らないものまで消えるので、実際に消えるものを模擬実行で調べて見せる
     removing="$(apt-get -s remove -- "${todo[@]}" | awk '$1 == "Remv" { print $2 }')"
     if [ -z "$removing" ]; then
-      echo "取り除くものはありません（既に入っていない）"
+      echo "nothing to remove (already uninstalled)"
       rm -f "$STATE_FILE"
       exit 0
     fi
-    echo "実際に取り除かれるパッケージ（依存しているものを含む）:"
+    echo "packages that will actually be removed (including dependents):"
     printf '%s\n' "$removing" | sed 's/^/  /'
-    confirm "sudo apt-get remove を実行しますか?" || { echo "中止しました"; exit 1; }
+    confirm "run sudo apt-get remove?" || { echo "aborted"; exit 1; }
     systemctl --user disable --now pulseaudio.socket pulseaudio.service 2>/dev/null || true
     sudo apt-get remove -y -- "${todo[@]}"
     rm -f "$STATE_FILE"
-    echo "取り除きました。依存で入ったライブラリは sudo apt-get autoremove で消せます。"
+    echo "removed; libraries pulled in as dependencies can be removed with sudo apt-get autoremove"
     ;;
 
   *)
-    sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
+    printf '%s\n' \
+      "Install the audio stack that micmux bridge needs on the remote host (Debian)." \
+      "" \
+      "  $0 --check    show the current state without changing anything" \
+      "  $0            install missing packages and start the user service" \
+      "  $0 --remove   remove the packages this script installed"
     exit 2
     ;;
 esac

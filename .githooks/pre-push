@@ -11,7 +11,7 @@
 set -eu
 
 if ! command -v betterleaks >/dev/null 2>&1; then
-	echo "[pre-push] betterleaks が無いため秘密の検査をスキップします（CI の secret-scan が最終の砦）。" >&2
+	echo "[pre-push] betterleaks not found; skipping the secret scan (CI secret-scan is the final safeguard)" >&2
 	exit 0
 fi
 
@@ -29,13 +29,13 @@ while read -r _lref lsha _rref rsha; do
 	else
 		range="$rsha..$lsha"
 	fi
-	echo "[pre-push] 秘密の検査: $range" >&2
+	echo "[pre-push] scanning for secrets: $range" >&2
 	if ! betterleaks git . --log-opts="$range --diff-merges=separate --no-renames" --config .betterleaks.toml --redact --no-banner --log-level=warn; then
 		status=1
 	fi
 done
 
 if [ "$status" -ne 0 ]; then
-	echo "[pre-push] 秘密の疑いがあるため push を中止します。" >&2
+	echo "[pre-push] possible secrets found, aborting push" >&2
 	exit 1
 fi
