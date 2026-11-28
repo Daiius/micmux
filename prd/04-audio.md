@@ -48,7 +48,11 @@ client からの PCM → pacat → null sink "micmux" → monitor source "micmux
 bridge は libpulse にリンクせず、`pactl` と `pacat` を子プロセスとして起動する。
 
 - 接続先のビルドに、開発ヘッダが要らない。
-- PulseAudio 互換の範囲しか使わないので、pipewire-pulse でも動く見込みがある（未確認）。
+- PulseAudio 互換の範囲しか使わないので、pipewire-pulse でも動く。2026-11-28 に、コンテナの中の
+  PipeWire 1.4.2（Debian 13、pipewire-pulse + WirePlumber）で確かめた。通しの試験の全項目、
+  `--set-default` とその復元、ALSA で録るアプリ（`arecord`、pipewire-alsa 経由）からの録音要求の検出が通る。
+  実体のある出力先が無いときの代役の名前も、PulseAudio と同じ `auto_null` である。
+  以後は CI の `e2e-pipewire` ジョブが、変更のたびに確かめる。実際の音声デバイスがある機械では未確認。
 - `pactl` の出力は、ロケールで表記が変わらないよう `LC_ALL=C` で読む。
 
 ### 1.3 アプリに仮想マイクを使わせる

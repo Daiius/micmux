@@ -42,7 +42,7 @@ tmux やターミナルエミュレーターには依存しない。
 | `LocalCommand` からの自動起動、裏での動作 | macOS で実測で確認 |
 | `--mux` による接続の相乗り（認証 1 回）、`Match exec` からの起動 | macOS と指紋認証の鍵で実測で確認 |
 | 裏で動かしたときのマイクの許可の引き継ぎ | macOS で実測で確認（端末から直接の場合と同じ音量が取れる） |
-| pipewire-pulse での動作 | 未確認（PulseAudio 17.0 で確認） |
+| 接続先が pipewire-pulse | CI とコンテナ（Debian 13 の PipeWire 1.4.2）で、通しの試験が通る。ALSA 経由の録音と `--set-default` も確認。実際の音声デバイスがある機械では未確認。日常的に使っている接続先は PulseAudio 17.0 |
 | Codex CLI | 未確認。0.162.1 の Linux 版バイナリには録音の実装が見当たらない（後述） |
 
 ## セットアップ

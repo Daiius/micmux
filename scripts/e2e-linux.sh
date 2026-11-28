@@ -3,22 +3,35 @@
 #
 #   ./scripts/e2e-linux.sh <micmux のバイナリ>
 #   E2E_NATIVE=1 ./scripts/e2e-linux.sh <--features native でビルドしたバイナリ>
+#   E2E_SERVER=pipewire ./scripts/e2e-linux.sh <micmux のバイナリ>
 #
 # 代役のマイク（音を流し込んだ null sink）から client が取得し、bridge を通って仮想マイクに
 # 届いた音を録って照合する。実際のマイクも SSH も使わない（--transport で bridge を直接起動する）。
 #
-# 利用者の音声サーバーには触れない。専用の PulseAudio を一時ディレクトリに立て、起動したものは
+# 利用者の音声サーバーには触れない。専用の音声サーバーを一時ディレクトリに立て、起動したものは
 # すべて PID を指定して止める。手元でも CI でも同じように動く。
 #
-# 要るもの: pulseaudio, pactl, pacat, parec, python3。
-# E2E_NATIVE=1 のときは、ALSA から PulseAudio へ繋ぐプラグイン（libasound2-plugins）も要る。
+# 音声サーバーは E2E_SERVER で選ぶ。pulseaudio（既定）か pipewire（pipewire-pulse + WirePlumber）。
+#
+# 要るもの: pactl, pacat, parec, python3 と、
+#   pulseaudio のとき: pulseaudio
+#   pipewire のとき:   pipewire, pipewire-pulse, wireplumber
+# E2E_NATIVE=1 のときは、ALSA から音声サーバーへ繋ぐプラグインも要る
+# （pulseaudio なら libasound2-plugins、pipewire なら pipewire-alsa）。
+# この 2 つは ALSA の既定デバイスを取り合うので、同じ環境に両方を入れない。
 
 set -euo pipefail
 
 BIN="${1:?usage: $0 <micmux binary>}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 2; }
-for c in pulseaudio pactl pacat parec python3; do
+SERVER="${E2E_SERVER:-pulseaudio}"
+case "$SERVER" in
+  pulseaudio) SERVER_CMDS=(pulseaudio) ;;
+  pipewire)   SERVER_CMDS=(pipewire pipewire-pulse wireplumber) ;;
+  *) echo "unknown E2E_SERVER: $SERVER (pulseaudio or pipewire)" >&2; exit 2 ;;
+esac
+for c in "${SERVER_CMDS[@]}" pactl pacat parec python3; do
   command -v "$c" >/dev/null || { echo "$c not found" >&2; exit 2; }
 done
 
@@ -39,6 +52,7 @@ cleanup() {
   if [ "$FAILED" -ne 0 ]; then
     echo "---- client.log"; cat "$W/client.log" 2>/dev/null || true
     echo "---- pulse.log";  tail -n 20 "$W/pulse.log" 2>/dev/null || true
+    echo "---- pipewire.log"; tail -n 20 "$W/pipewire.log" "$W/wireplumber.log" 2>/dev/null || true
   fi
   rm -rf "$W"
 }
@@ -77,19 +91,39 @@ sink_exists() { pactl list short sinks | cut -f2 | grep -qx "$1"; }
 
 echo "== start a dedicated sound server"
 # D-Bus を切り離さないと、利用者の音声サーバーと名前が衝突して起動しない
-# module-always-sink: 実体のある出力先が無いときの代役（auto_null）を置く。ヘッドレスのサーバーと同じ状態にする
-DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent pulseaudio -n \
-  -L "module-native-protocol-unix socket=$W/pulse-rt/native" -L module-always-sink \
-  --daemonize=no --exit-idle-time=-1 --use-pid-file=no --log-target="file:$W/pulse.log" &
-PIDS+=($!)
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent
+if [ "$SERVER" = pipewire ]; then
+  # ソケットは XDG_RUNTIME_DIR と PULSE_RUNTIME_PATH の下にできるので、利用者のものとは別になる。
+  # 実体のある出力先が無いときの代役（auto_null）は、pipewire-pulse が自分で置く
+  pipewire >"$W/pipewire.log" 2>&1 &
+  PIDS+=($!)
+  wait_for 10 test -S "$XDG_RUNTIME_DIR/pipewire-0" || fail "pipewire did not start"
+  wireplumber >"$W/wireplumber.log" 2>&1 &
+  PIDS+=($!)
+  pipewire-pulse >"$W/pulse.log" 2>&1 &
+  PIDS+=($!)
+else
+  # module-always-sink: 実体のある出力先が無いときの代役（auto_null）を置く。ヘッドレスのサーバーと同じ状態にする
+  pulseaudio -n \
+    -L "module-native-protocol-unix socket=$W/pulse-rt/native" -L module-always-sink \
+    --daemonize=no --exit-idle-time=-1 --use-pid-file=no --log-target="file:$W/pulse.log" &
+  PIDS+=($!)
+fi
 wait_for 10 pactl info || fail "sound server did not start"
 pactl info | grep -q "$W" || fail "not connected to the dedicated sound server"
-ok "sound server"
+if [ "$SERVER" = pipewire ]; then
+  pactl info | grep -q 'Server Name:.*PipeWire' || fail "the sound server is not PipeWire"
+  # 代役の出力先は、WirePlumber が動き出してから現れる
+  wait_for 10 sink_exists auto_null || fail "the placeholder sink did not appear"
+fi
+ok "sound server ($(pactl info | sed -n 's/^Server Name: //p'))"
 
 echo "== connect client and bridge"
 CAPTURE=(--capture-cmd "parec --device=fakemic.monitor --raw --rate=16000 --channels=1 --format=s16le --latency-msec=20")
 if [ "${E2E_NATIVE:-0}" = 1 ]; then
-  # 内蔵の取得（cpal → ALSA → PulseAudio）。既定の録音デバイスの代わりに、代役のマイクを指す
+  # 内蔵の取得（cpal → ALSA → 音声サーバー）。既定の録音デバイスの代わりに、代役のマイクを指す。
+  # PULSE_SOURCE が効くのは PulseAudio の ALSA プラグインだけ。PipeWire のものは見ないので、
+  # 下で代役のマイクを作ったあと、既定の録音デバイスにもする
   CAPTURE=()
   export PULSE_SOURCE=fakemic.monitor
   echo "   (using built-in capture)"
@@ -112,6 +146,7 @@ ok "default sink is $(pactl get-default-sink)"
 echo "== play a continuous 1 kHz tone into the fake mic"
 # bridge より後に作る。先に作ると、これが既定の出力先になってしまい、下の混入の試験にならない
 FAKEMIC_MODULE="$(pactl load-module module-null-sink sink_name=fakemic rate=48000 channels=1 format=s16le)"
+if [ "${E2E_NATIVE:-0}" = 1 ]; then pactl set-default-source fakemic.monitor; fi
 python3 - "$W/tone.raw" <<'PY'
 import struct, sys, math
 # 1 秒ぶん。1 kHz は 48 kHz でちょうど 48 サンプル周期なので、つなぎ目で途切れない

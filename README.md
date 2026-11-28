@@ -44,7 +44,7 @@ As of 2026-11-27. Voice input into Claude Code from macOS to Debian over a real 
 | Automatic start from `LocalCommand`, running in the background | Confirmed by testing on macOS |
 | Sharing the connection with `--mux` (authenticate once), starting from `Match exec` | Confirmed by testing on macOS with a fingerprint-protected key |
 | Microphone permission when running in the background | Confirmed by testing on macOS (same level as when run directly from the terminal) |
-| pipewire-pulse | Not tested (tested with PulseAudio 17.0) |
+| pipewire-pulse on the remote host | Passes the end-to-end test in CI and in a container (PipeWire 1.4.2 on Debian 13), including recording through ALSA and `--set-default`. Not tested on a machine with real audio devices. The remote host in daily use runs PulseAudio 17.0 |
 | Codex CLI | Not tested. The 0.162.1 Linux binary appears to have no recording implementation (see below) |
 
 ## Setup

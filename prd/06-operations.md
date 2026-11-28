@@ -151,7 +151,8 @@ gap: 録音要求を断ったこと（disarmed）は、裏で動いているあ�
 - `scripts/e2e-linux.sh` で、音声の通しの試験を実行する。代役のマイク（音を流し込んだ null sink）から
   client が取得し、bridge を通って仮想マイクに届いた音を録って照合する。armed での転送、disarmed での拒否、接続先で鳴らした音が混ざらないこと（別の bridge が先に終わった場合と、既定の出力先を確かめられない場合を含む）、
   arm のし直し、client が突然終わったときの後片付けを見る。専用の音声サーバーを一時ディレクトリに立てる。
-  `E2E_NATIVE=1` で、内蔵の取得（cpal → ALSA → PulseAudio）を通す。
+  `E2E_NATIVE=1` で、内蔵の取得（cpal → ALSA → 音声サーバー）を通す。
+  `E2E_SERVER=pipewire` で、PulseAudio の代わりに PipeWire で回す。
 - 接続先の音声サーバーを使う動作試験は、**利用者の実運用の音声サーバーとは別に立てた、隔離した
   インスタンス**で行う。手順と注意は `AGENTS.md` にある。
 - 対応する Rust は 1.89 以降（`Cargo.toml` の `rust-version`）。
@@ -162,7 +163,7 @@ gap: 録音要求を断ったこと（disarmed）は、裏で動いているあ�
 
 | workflow | 内容 |
 |---|---|
-| `ci` | ビルド・テスト・lint（警告は 0 件を保つ）、`native` feature の lint、`rust-version` の版でのビルド、音声の通しの試験。文書だけの変更では回さない |
+| `ci` | ビルド・テスト・lint（警告は 0 件を保つ）、`native` feature の lint、`rust-version` の版でのビルド、音声の通しの試験（PulseAudio と PipeWire）。文書だけの変更では回さない |
 | `audit` | 依存関係を、既知の脆弱性と照合する（`cargo audit`）。依存を変えた PR と、週に 1 回 |
 | `secret-scan` | 全 ref の全履歴を、Betterleaks で秘密の検査にかける |
 

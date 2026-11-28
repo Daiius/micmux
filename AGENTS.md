@@ -85,11 +85,16 @@ cargo build --release
 
 代役のマイク（音を流し込んだ null sink）から client が取得し、bridge を通って仮想マイクに届いた音を
 録って照合する。armed での転送、disarmed での拒否、接続先で鳴らした音が混ざらないこと（別の bridge が先に終わった場合と、既定の出力先を確かめられない場合を含む）、arm のし直し、client が突然終わったときの後片付けを見る。
-専用の音声サーバーを一時ディレクトリに立てるので、実運用のものには触れない。CI の `e2e` ジョブも
-同じスクリプトを回す。
+専用の音声サーバーを一時ディレクトリに立てるので、実運用のものには触れない。CI の `e2e` と
+`e2e-pipewire` のジョブも、同じスクリプトを回す。
 
 `--features native` でビルドしたバイナリに `E2E_NATIVE=1` を付けると、内蔵の取得
-（cpal → ALSA → PulseAudio）を通す。接続元を Linux にする場合の経路である。
+（cpal → ALSA → 音声サーバー）を通す。接続元を Linux にする場合の経路である。
+
+`E2E_SERVER=pipewire` を付けると、PulseAudio の代わりに PipeWire（pipewire-pulse + WirePlumber）で回す。
+PipeWire が入っていないマシンでは、コンテナの中で回す（`pipewire`・`pipewire-pulse`・`wireplumber`・
+`pulseaudio-utils`、内蔵の取得には `pipewire-alsa` も要る）。`pipewire-alsa` と `libasound2-plugins` は
+ALSA の既定デバイスを取り合うので、同じ環境に両方を入れない。
 
 ### client と bridge を 1 台の中でつなぐ
 
@@ -109,7 +114,7 @@ micmux connect --transport "/path/to/micmux bridge --sink-name mmtest" --capture
 
 | workflow | 内容 |
 |---|---|
-| `ci` | ビルド・テスト・lint、`native` feature の lint、`rust-version` の版でのビルド（`msrv`）、音声の通しの試験（`e2e`）。すべて Linux。文書だけの変更では回らない |
+| `ci` | ビルド・テスト・lint、`native` feature の lint、`rust-version` の版でのビルド（`msrv`）、音声の通しの試験（PulseAudio は `e2e`、PipeWire は `e2e-pipewire`）。すべて Linux。文書だけの変更では回らない |
 | `audit` | 依存関係を、既知の脆弱性と照合する（`cargo audit`）。依存を変えた PR と、週に 1 回 |
 | `secret-scan` | 全 ref の全履歴を、Betterleaks で秘密の検査にかける |
 
