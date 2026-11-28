@@ -1,6 +1,6 @@
 {
   "prd": {
     "type": "in-repo",
-    "paths": ["prd/", "AGENTS.md", "README.md"]
+    "paths": ["prd/", "AGENTS.md", "README.md", "README.ja.md"]
   }
 }

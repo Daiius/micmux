@@ -1,79 +1,88 @@
 # micmux
 
+[日本語](./README.ja.md)
+
 > On-demand microphone forwarding over SSH, independent of terminals and applications.
 
-SSH 接続元のマイクを、接続先の仮想マイクとして使えるようにする。
-接続先のアプリが録音を始めた瞬間だけ接続元のマイクが起動し、録音が終わると止まる。
+micmux lets you use the microphone on your SSH client machine as a virtual microphone on the remote host.
+The local microphone turns on only at the moment an app on the remote host starts recording, and turns off when recording ends.
 
-```text
-接続元 (macOS)                         接続先 (Debian)
-┌──────────────────────┐   SSH    ┌───────────────────────────────────┐
-│ マイク → micmux connect ├─────────┤ micmux bridge → 仮想マイク → アプリ │
-└──────────────────────┘ stdin/out └───────────────────────────────────┘
-        ← START / STOP（録音要求）
-        → PCM（armed のときだけ）
+```mermaid
+flowchart LR
+  subgraph local["Local (macOS)"]
+    mic(["Microphone"]) --> connect["micmux connect"]
+  end
+  subgraph remote["Remote (Debian)"]
+    bridge["micmux bridge"] --> vmic(["Virtual mic"]) --> app["App"]
+  end
+  connect -- "audio (PCM), only while armed" --> bridge
+  bridge -. "START / STOP (recording requests)" .-> connect
 ```
 
-音声は端末の入出力とは別の経路（専用の SSH 接続、または多重化した別チャネル）で送るので、
-tmux やターミナルエミュレーターには依存しない。
+Both arrows between `micmux connect` and `micmux bridge` travel over one SSH connection (the standard input and
+output of `ssh`).
 
-仕様と設計の判断は [`prd/`](./prd/) に、決定の経緯は [`prd/_grilling/decisions.md`](./prd/_grilling/decisions.md) にある。
-開発を手伝うエージェント向けの手引きは [`AGENTS.md`](./AGENTS.md)。
+Audio travels on a path separate from the terminal's input and output (a dedicated SSH connection, or a separate
+channel on a multiplexed one), so micmux does not depend on tmux or the terminal emulator.
 
-## 現状
+The specification and design decisions are in [`prd/`](./prd/), and the history of decisions is in
+[`prd/_grilling/decisions.md`](./prd/_grilling/decisions.md). The guide for agents that help with development is
+[`AGENTS.md`](./AGENTS.md). These design documents, as well as the issues, are written in Japanese.
 
-2026-11-27 時点。macOS から Debian へ、実際の SSH 越しに Claude Code へ音声入力できることを確認済み。
+## Status
 
-| 項目 | 状態 |
+As of 2026-11-27. Voice input into Claude Code from macOS to Debian over a real SSH connection has been confirmed.
+
+| Item | Status |
 |---|---|
-| Claude Code 2.1.332 が SSH + tmux 内で仮想マイクから録音し、文字起こしできる | 実測で確認 |
-| 録音の開始・終了を PulseAudio の録音ストリームの有無で検出できる | 実測で確認 |
-| disarmed では録音要求を断る / arm で受け付ける | 実測で確認 |
-| 接続元の異常終了・端末ごとの切断・bridge への SIGTERM で接続先が元に戻る | 実測で確認 |
-| macOS (Core Audio) でのマイク取得 | 実測で確認。Linux (ALSA) でも動作確認 |
-| 実際の SSH 越しの転送と、日本語の文字起こし | 実測で確認 |
-| `LocalCommand` からの自動起動、裏での動作 | macOS で実測で確認 |
-| `--mux` による接続の相乗り（認証 1 回）、`Match exec` からの起動 | macOS と指紋認証の鍵で実測で確認 |
-| 裏で動かしたときのマイクの許可の引き継ぎ | macOS で実測で確認（端末から直接の場合と同じ音量が取れる） |
-| pipewire-pulse での動作 | 未確認（PulseAudio 17.0 で確認） |
-| Codex CLI | 未確認。0.162.1 の Linux 版バイナリには録音の実装が見当たらない（後述） |
+| Claude Code 2.1.332 records from the virtual mic inside SSH + tmux and transcribes the speech | Confirmed by testing |
+| Start and end of recording are detected from the presence of PulseAudio recording streams | Confirmed by testing |
+| Requests are denied while disarmed / accepted after arm | Confirmed by testing |
+| The remote host is restored after the local side crashes, the terminal is closed, or the bridge receives SIGTERM | Confirmed by testing |
+| Microphone capture on macOS (Core Audio) | Confirmed by testing. Also works on Linux (ALSA) |
+| Forwarding over a real SSH connection, and transcription of Japanese speech | Confirmed by testing |
+| Automatic start from `LocalCommand`, running in the background | Confirmed by testing on macOS |
+| Sharing the connection with `--mux` (authenticate once), starting from `Match exec` | Confirmed by testing on macOS with a fingerprint-protected key |
+| Microphone permission when running in the background | Confirmed by testing on macOS (same level as when run directly from the terminal) |
+| pipewire-pulse | Not tested (tested with PulseAudio 17.0) |
+| Codex CLI | Not tested. The 0.162.1 Linux binary appears to have no recording implementation (see below) |
 
-## セットアップ
+## Setup
 
-### 接続先 (Debian)
+### Remote host (Debian)
 
-音声基盤を入れる。変更前に `--check` で現状を見られる。
+Install the audio stack. You can review the current state with `--check` before changing anything.
 
 ```sh
 ./scripts/setup-debian-server.sh --check
 ./scripts/setup-debian-server.sh
 ```
 
-micmux をビルドして PATH に置く。接続先のビルドに音声関係の開発ヘッダは要らない。
+Build micmux and put it on PATH. Building on the remote host does not need any audio development headers.
 
 ```sh
 cargo install --path .
 micmux doctor
 ```
 
-### 接続元 (macOS)
+### Local machine (macOS)
 
 ```sh
 cargo install --path .
 ```
 
-初回の録音時に、ターミナルアプリに対するマイクのアクセス許可を macOS が尋ねる。
+The first time you record, macOS asks for permission for your terminal app to access the microphone.
 
-## 使い方
+## Usage
 
-接続元で:
+On the local machine:
 
 ```sh
 micmux connect dev-server --set-default
 ```
 
-起動直後は **disarmed**（録音要求をすべて断る）。Enter で armed と disarmed を切り替える。
-別の端末やキーバインドからは次のコマンドで操作できる。
+micmux starts **disarmed** (it denies all recording requests). Press Enter to toggle between armed and disarmed.
+From another terminal or a key binding, use these commands:
 
 ```sh
 micmux arm
@@ -82,13 +91,13 @@ micmux toggle
 micmux status --json
 ```
 
-接続先では、いつも通り SSH + tmux の中でアプリを使う。Claude Code なら `/voice` で音声入力を有効にし、
-スペースキーを押しているあいだ録音される。
+On the remote host, use your apps inside SSH + tmux as usual. In Claude Code, enable voice input with `/voice`;
+it records while you hold down the space bar.
 
-### ssh に連動して自動で起動する
+### Starting automatically with ssh
 
-`~/.ssh/config` に 2 行足すと、`ssh dev-server` したときに micmux が裏で立ち上がり、
-その SSH を閉じると終了する。別の端末で `micmux connect` を実行する必要がなくなる。
+Add two lines to `~/.ssh/config`, and `ssh dev-server` starts micmux in the background; it exits when that
+SSH session closes. You no longer need to run `micmux connect` in a separate terminal.
 
 ```
 Host dev-server
@@ -96,26 +105,26 @@ Host dev-server
     LocalCommand micmux connect %n --set-default --background --watch-pid $PPID
 ```
 
-- 接続先で micmux が PATH に無い場合は `--remote-cmd '~/.cargo/bin/micmux'` を足す
-  （非対話の SSH ではログインシェルの設定が読まれないことがある）。
-- 同じホストへ SSH を複数開いた場合、2 本目以降は動いている micmux に相乗りする。
-  すべての SSH が終わった時点で micmux も終わる。ただし、端末から `--watch-pid` 無しで
-  手で起動した micmux に相乗りした場合は、その SSH が終わっても micmux は動き続ける。
-- 起動直後は disarmed。録音の許可は `micmux arm` / `micmux toggle` で切り替える
-  （キーバインドに割り当てておくとよい）。裏で動いているあいだは、録音要求を断っても
-  ログにしか出ないので気づきにくい。最初から許可するなら `--armed` を足す。
-- 裏で動いているあいだの表示は `~/.local/state/micmux/client.log` に出る（本人だけが読める権限で作る）。
-  起動時に 1 MB を超えていたら `client.log.1` に退避して作り直す。`XDG_STATE_HOME` も `HOME` も無い環境では
-  ログの置き場所が決まらないので、`--log` で指定しない限り起動しない。
-- 端末が無いのでパスフレーズを尋ねられない。鍵は ssh-agent に載せておく。
-- `LocalCommand` は `git` や `scp` がそのホストへ繋ぐときにも走る。その場合 micmux は
-  接続が終わるのと同時に終了する。
+- If micmux is not on PATH on the remote host, add `--remote-cmd '~/.cargo/bin/micmux'`
+  (non-interactive SSH sessions may not read your login shell configuration).
+- If you open several SSH sessions to the same host, the second and later ones join the running micmux.
+  micmux exits when all of them have ended. However, if they join a micmux you started by hand from a terminal
+  without `--watch-pid`, micmux keeps running after those SSH sessions end.
+- micmux starts disarmed. Allow recording with `micmux arm` / `micmux toggle`
+  (binding them to keys is convenient). While running in the background, denied requests show up only in
+  the log, so they are easy to miss. Add `--armed` to allow recording from the start.
+- While running in the background, messages go to `~/.local/state/micmux/client.log` (created readable only by you).
+  If it is larger than 1 MB at startup, it is moved to `client.log.1` and started anew. If neither `XDG_STATE_HOME`
+  nor `HOME` is set, the log location cannot be determined, so micmux does not start unless you specify `--log`.
+- There is no terminal, so micmux cannot ask for a passphrase. Load your key into ssh-agent.
+- `LocalCommand` also runs when `git` or `scp` connects to that host. In that case micmux exits as soon as
+  the connection ends.
 
-### 認証を 1 回で済ませる
+### Authenticating only once
 
-micmux は端末用とは別の SSH 接続を張るので、そのままでは認証が 2 回要る。
-接続のたびに指紋認証やパスフレーズの入力がある鍵では、`--mux` で端末用の接続に相乗りさせると
-1 回で済む（SSH の多重化を使う）。
+micmux opens an SSH connection separate from the terminal's, so by default you authenticate twice.
+If your key requires a fingerprint or passphrase on every connection, use `--mux` to share the terminal's
+connection so you authenticate only once (this uses SSH multiplexing).
 
 ```
 Host dev-server
@@ -126,199 +135,203 @@ Host dev-server
 Match originalhost dev-server exec "micmux connect %n --mux --background --watch-pid $PPID --set-default"
 ```
 
-- `LocalCommand` の代わりに `Match ... exec` で起動する。相乗りした 2 本目以降の SSH では
-  `LocalCommand` が走らないため。上の `LocalCommand` の設定と併用する必要はない。
-- `Match originalhost` は、コマンドラインで指定した名前が一致したときだけ発動する。
-  IP アドレスや別の名前で接続すると micmux は起動しない。
-- micmux は、端末用の SSH が認証を終えるのを待ってから接続する。
-- `ControlMaster`（`auto` など）、`ControlPath`、`ControlPersist` は必須。どれかが欠けていると
-  micmux は起動時にそう伝えて終わる。`ControlPersist` により、最後の SSH を閉じたあとも
-  指定した時間は接続が保たれる（そのあいだの再接続は認証なしで通る）。
-- 音声と端末の通信が同じ TCP 接続を通る。大量の出力を流している最中は音声が遅れうる。
-  通常の使い方では、接続を分けた場合との差は実測で見られなかった（後述）。
+- Start micmux from `Match ... exec` instead of `LocalCommand`, because `LocalCommand` does not run for the
+  second and later SSH sessions that share the connection. You do not need the `LocalCommand` setting above as well.
+- `Match originalhost` matches only when the name given on the command line matches.
+  If you connect by IP address or another name, micmux does not start.
+- micmux waits for the terminal's SSH to finish authenticating before it connects.
+- `ControlMaster` (`auto` or similar), `ControlPath`, and `ControlPersist` are required. If any of them is missing,
+  micmux says so at startup and exits. Thanks to `ControlPersist`, the connection stays open for the given time
+  after the last SSH session closes (reconnecting during that time needs no authentication).
+- Audio and terminal traffic share the same TCP connection. Audio can lag while a large amount of output is streaming.
+  In normal use, no difference from separate connections was observed in testing (see below).
 
-うまく動かないときは、接続元で次を実行すると状況をまとめて表示する。
-micmux の版、動いているプロセス、ログの末尾、ssh の設定、端末なしでの接続可否、
-マイクから音が取れるか（端末から直接と、切り離した状態の両方）を出す。
+If things do not work, run the following on the local machine to print a summary of the situation:
+the micmux version, running processes, the end of the log, the ssh configuration, whether a connection without
+a terminal works, and whether audio can be captured from the microphone (both directly from the terminal and detached from it).
 
 ```sh
 micmux debug dev-server
 ```
 
-`connect` に `--remote-cmd` を付けている場合は、`debug` にも同じものを付ける。
+If you pass `--remote-cmd` to `connect`, pass the same to `debug`.
 
-### 録音デバイスの選ばれ方
+### How the recording device is chosen
 
-`--set-default` を付けると、接続中だけ仮想マイクを接続先の既定の録音デバイスにする（切断時に戻す）。
-既定を変えたくない場合は付けずに、使いたいアプリにだけ環境変数で指定する。
+With `--set-default`, the virtual mic becomes the default recording device on the remote host while connected
+(the previous default is restored on disconnect). If you do not want to change the default, omit it and point only
+the app you want at the virtual mic with an environment variable.
 
 ```sh
 PULSE_SOURCE=micmux.monitor claude
 ```
 
-### 主なオプション
+### Main options
 
-| オプション | 意味 |
+| Option | Meaning |
 |---|---|
-| `--armed` | 最初から録音を許可する |
-| `--max-seconds <n>` | 連続録音時間の上限（既定 120 秒）。達すると disarm する。`0` で上限なし |
-| `--remote-cmd <path>` | 接続先での micmux の場所。非対話の SSH では `~/.cargo/bin` が PATH に無いことがある |
-| `--ssh-arg <arg>` | ssh に渡す追加の引数 |
-| `--capture-cmd <cmd>` | マイク取得を外部コマンドに任せる。s16le モノラルを stdout に出すもの |
-| `--transport <cmd>` | ssh の代わりに使う接続コマンド |
-| `--background` | 端末から切り離して裏で動く |
-| `--watch-pid <pid>` | 指定したプロセスが終わったら自分も終わる |
-| `--mux` | 端末用の SSH 接続に相乗りする |
+| `--armed` | Allow recording from the start |
+| `--max-seconds <n>` | Limit on continuous recording (default 120 seconds). micmux disarms when it is reached. `0` for no limit |
+| `--remote-cmd <path>` | Path to micmux on the remote host. Non-interactive SSH sessions may not have `~/.cargo/bin` on PATH |
+| `--ssh-arg <arg>` | Extra argument for ssh |
+| `--capture-cmd <cmd>` | Capture with an external command that writes s16le mono to stdout |
+| `--transport <cmd>` | Connect with this command instead of ssh |
+| `--background` | Detach from the terminal and run in the background |
+| `--watch-pid <pid>` | Exit when the given process exits |
+| `--mux` | Share the terminal's SSH connection |
 
-内蔵のマイク取得がうまく動かない場合は、SoX で代用できる。
+If the built-in microphone capture does not work, you can use SoX instead.
 
 ```sh
 micmux connect dev-server --capture-cmd 'rec -q -t raw -r 16000 -e signed -b 16 -c 1 -'
 ```
 
-## 仕組み
+## How it works
 
-### 接続先: bridge
+### Remote side: bridge
 
-1. null sink を 1 つ作る。その monitor source が仮想マイクになる。
-2. `pactl subscribe` で録音ストリームの増減を監視する。イベントをそのまま START / STOP に
-   変換せず、イベントのたびに「仮想マイクに繋がっていて cork されていない録音ストリームの数」を
-   取り直して状態を決める。
-3. 数が 0 → 1 以上になったら START、0 に戻って 300 ms 経ったら STOP を送る。
-4. 届いた PCM を `pacat` で null sink に流す。`pacat` は録音セッションごとに起動し直すので、
-   前のセッションの残りが次に混ざらない。
+1. Create a null sink. Its monitor source becomes the virtual mic.
+2. Watch recording streams come and go with `pactl subscribe`. Events are not turned into START / STOP directly;
+   on every event, the bridge recounts "recording streams attached to the virtual mic that are not corked" and
+   decides the state from that.
+3. When the count goes from 0 to 1 or more, send START; when it returns to 0 and stays there for 300 ms, send STOP.
+4. Play the received PCM into the null sink with `pacat`. `pacat` is restarted for every recording session, so
+   leftovers from the previous session do not leak into the next one.
 
-実体のある出力先が無い接続先（ヘッドレスのサーバー）では、仮想マイクの sink が既定の出力先に選ばれ、
-接続先で鳴った音が仮想マイクに混ざってしまう。bridge は、出力の捨て先（`micmux_discard`）を別に作って
-既定の出力先にし、これを防ぐ。
+On a remote host with no real output device (a headless server), the virtual mic's sink gets chosen as the default
+sink, and any sound played on the remote host leaks into the virtual mic. To prevent this, the bridge creates a
+separate discard sink (`micmux_discard`) and makes it the default sink.
 
-libpulse にはリンクせず、`pactl` と `pacat` を子プロセスとして使う。
+The bridge does not link against libpulse; it runs `pactl` and `pacat` as child processes.
 
-接続元がスリープやネットワークの切り替えで消えると、TCP が半開きのまま残り、bridge には
-切断が伝わらない（sshd の既定では何時間も）。そこで client は 10 秒ごとに生存確認を送り、
-bridge は 30 分間何も届かなければ後片付けをして終わる。短いスリープから復帰した接続元が
-そのまま使い続けられるよう、この時間は長めにしてある。sshd 側で `ClientAliveInterval` を
-設定しておくと、ssh の接続そのものも早く片付く。
+When the local machine disappears because of sleep or a network change, the TCP connection is left half-open and
+the bridge is not told about the disconnect (for hours, with sshd's defaults). So the client sends a keepalive every
+10 seconds, and the bridge cleans up and exits if nothing arrives for 30 minutes. This timeout is deliberately long so
+that a local machine waking from a short sleep can keep using the connection. Setting `ClientAliveInterval` on the
+sshd side also gets the ssh connection itself cleaned up sooner.
 
-同じ名前の仮想マイクを使う bridge は 1 つだけ動く。前の bridge が残っているところへ新しい
-bridge が起動すると、前の bridge を終わらせ、その後片付けが済んでから仮想マイクを作る。
+Only one bridge runs per virtual mic name. When a new bridge starts while a previous one is still around, it stops
+the previous bridge and waits for its cleanup before creating the virtual mic.
 
-### 接続元: client
+### Local side: client
 
-`recording = armed && connected && requested`。bridge からの START は要求でしかなく、
-armed でなければ断る。待機中は入力デバイスを開かない。
+`recording = armed && connected && requested`. A START from the bridge is only a request, and it is denied unless
+armed. While idle, the input device is not opened.
 
-接続先は無条件には信頼しない。
+The remote host is not trusted unconditionally.
 
-- 連続録音時間が `--max-seconds` に達したら録音を止めて disarm する。続けるには `micmux arm` が要る。
-  録音中に START が届き直しても、時間は数え直さない。
-- 接続先から届いた文字列（仮想マイクの名前、エラー、ssh の標準エラー出力）は、端末の制御文字を
-  取り除き、1 行の長さと 1 分あたりの行数を制限してから表示する。ssh 自身のメッセージもここを通る
-  （パスフレーズや host key の確認は ssh が端末に直接尋ねるので影響しない）。
+- When continuous recording reaches `--max-seconds`, recording stops and micmux disarms. Continuing requires
+  `micmux arm`. A START that arrives again during recording does not reset the timer.
+- Strings from the remote host (the virtual mic name, errors, ssh's standard error) are shown only after terminal
+  control characters are stripped and the line length and lines per minute are limited. ssh's own messages also go
+  through this (passphrase and host key prompts are unaffected, because ssh asks for them on the terminal directly).
 
-48 kHz のような 16 kHz の整数倍のレートは 16 kHz に落としてから送る（32 KB/秒）。
-それ以外のレートはそのまま送り、接続先のサウンドサーバーに変換を任せる。
+Rates that are integer multiples of 16 kHz, such as 48 kHz, are downsampled to 16 kHz before sending (32 KB/s).
+Other rates are sent as is, and the sound server on the remote host converts them.
 
-### プロトコル
+### Protocol
 
-`type (u8) | length (u32 LE) | payload` のフレームを SSH の標準入出力に流す。
-詳細は `src/protocol.rs`。
+Frames of `type (u8) | length (u32 LE) | payload` flow over SSH's standard input and output.
+See `src/protocol.rs` for details.
 
-## 調べてわかったこと
+## Findings
 
-### Claude Code の録音経路（バイナリの解析と実測）
+### Claude Code's recording path (binary analysis and testing)
 
-- Linux では次の順で録音方法を選ぶ。
-  1. 内蔵の録音モジュール（cpal 0.15.3、ALSA を直接使う）。`/proc/asound/cards` にカードがあるとき
+- On Linux, it chooses a recording method in this order:
+  1. The built-in recording module (cpal 0.15.3, which uses ALSA directly), when `/proc/asound/cards` lists a card
   2. `arecord`
-  3. SoX の `rec`
-- **PulseAudio を直接は使わない。** ALSA の既定デバイスを開くので、ALSA → PulseAudio の
-  プラグイン（`libasound2-plugins`）が橋渡しをする。Debian の `pulseaudio` パッケージは、
-  サーバーが動いていれば ALSA の既定をそちらへ向ける設定を入れる。
-- 録音ストリームはキーを押すと作られ、離すと破棄される。常時開きっぱなしにはしない。
-- 本番の録音の直前に、ごく短い試し開きが 1 回ある。STOP の猶予 (300 ms) はこれを
-  1 セッションにまとめるためのもの。
-- 要求する形式は 48 kHz / float32 / モノラル。
-- SSH 越しであること自体は音声機能を無効にする条件になっていない。
+  3. SoX's `rec`
+- **It does not use PulseAudio directly.** It opens the ALSA default device, and the ALSA → PulseAudio plugin
+  (`libasound2-plugins`) bridges the two. Debian's `pulseaudio` package installs a configuration that points the ALSA
+  default at the server while it is running.
+- The recording stream is created when you press the key and destroyed when you release it. It is not kept open.
+- Just before the real recording, there is one very short trial open. The STOP grace period (300 ms) exists to merge
+  it into one session.
+- The requested format is 48 kHz / float32 / mono.
+- Being over SSH is not, by itself, a condition that disables the voice feature.
 
 ### Codex CLI
 
-0.162.1 の Linux 版（musl の静的リンク）には ALSA や PulseAudio を呼ぶ痕跡が無かった。
-Linux 版では録音できない可能性が高いが、実際に起動しては確かめていない。
+The 0.162.1 Linux build (statically linked with musl) showed no trace of calling ALSA or PulseAudio.
+It most likely cannot record on Linux, but this has not been verified by actually running it.
 
-## 実測値
+## Measurements
 
-macOS (Apple シリコン、内蔵マイク) から Debian へ、往復 約 10 ms の回線で測った。
+Measured from macOS (Apple silicon, built-in microphone) to Debian, over a link with a round trip of about 10 ms.
 
-| 区間 | 値 |
+| Interval | Value |
 |---|---|
-| 録音要求を受けてからマイクが最初の音声を出すまで | 105〜110 ms（起動直後の初回のみ 約 140 ms） |
-| 同じ区間を接続先から見た値（通信の往復を含む） | 110〜118 ms |
-| 接続先で仮想マイクへ流し込む際のバッファ | 60 ms（設定値） |
-| 転送量 | 約 32 KB/秒（録音中のみ） |
+| From the recording request until the microphone produces the first audio | 105–110 ms (about 140 ms only for the first time after startup) |
+| The same interval seen from the remote host (including the network round trip) | 110–118 ms |
+| Buffer used when feeding the virtual mic on the remote host | 60 ms (configured value) |
+| Bandwidth | About 32 KB/s (only while recording) |
 
-- 接続を分けた場合と `--mux` で相乗りした場合とで、上の値に差は無かった。
-- 27 秒間の連続録音でも、受信した音声の長さは録音時間と 0.1 秒差で、遅れは溜まらなかった。
-- 文字起こしにかかる時間は micmux の外で、ここには含まれない。
+- There was no difference in these values between separate connections and sharing with `--mux`.
+- Even in 27 seconds of continuous recording, the length of the received audio was within 0.1 seconds of the recording
+  time, and no delay built up.
+- Transcription time is outside micmux and not included here.
 
-これらの数字は、裏で動かしたときのログと `micmux status` の `rtt` で確認できる。
+You can check these numbers in the log from a background run and in the `rtt` of `micmux status`.
 
-## 既知の制限
+## Known limitations
 
-- **発話の冒頭が欠けうる。** 録音要求が来てからマイクを開くので、開くまでの音は届かない。
-  START から最初の音声が届くまでの実測値は、macOS (Core Audio) で約 110 ms、
-  Linux (ALSA → PulseAudio) で 0.6〜1.0 秒。macOS からなら実用上ほぼ気にならないが、
-  Linux を接続元にする場合はキーを押してひと呼吸おいてから話す必要がある。
-- 送信が詰まっている最中は、取得スレッドの停止が送信の完了待ちになる。接続先が受信を止めると、
-  その間は `micmux disarm` や `q` が効かず（`timeout` と返る）、マイクも開いたままになる。
-  止めた後の音声が送られることはない。抜け出すには Ctrl+C か、micmux のプロセスを kill する。
-- 連続録音時間の上限は、1 回の録音の長さを抑えるもの。armed のあいだは、接続先が録音の終了と
-  開始を繰り返せば、上限より短い録音を何度でも始められる。録音させたくない間は disarm しておく。
-- 接続元が Linux で、`XDG_RUNTIME_DIR` も `TMPDIR` も無い環境では、操作用ソケットを
-  `/tmp/micmux-<ユーザー名>.sock` に置く。同じマシンの別の利用者が先にこの名前のファイルを作ると、
-  micmux が起動できない、相乗りしたつもりで何もせずに終わる、あるいは操作用ソケット無しで動いて
-  `micmux disarm` が届かない、といったことが起こりうる。macOS ではユーザーごとの一時ディレクトリを使うので起こらない。
-- 接続先で `XDG_RUNTIME_DIR` が無い環境では、bridge の排他用のファイルを `/tmp` に置く。同じマシンの
-  別の利用者が先にこの名前のファイルを作ると、排他が効かなくなり、前の bridge が残っていた場合に
-  仮想マイクが壊れうる（別の利用者のプロセスを止めてしまうことはない）。通常の SSH ログインでは設定されている。
-- 接続先のサウンドカードが 1 枚も無く `arecord` も無い環境では、Claude Code が録音方法を
-  見つけられない。`alsa-utils` を入れる。
-- 接続元のマイクは、常に OS の既定の入力デバイスを使い、全チャンネルを平均する。多チャンネルの
-  オーディオインターフェースでは音量が下がる。既定の入力が Bluetooth のイヤホンだと、録音のたびに
-  通話用の接続に切り替わる（[#12](https://github.com/Daiius/micmux/issues/12)）。
-- 接続中に接続先へ音声機器を抜き差しすると、既定の録音デバイスが切り替わり、仮想マイクから外れたままに
-  なることがある（[#13](https://github.com/Daiius/micmux/issues/13)）。
-- エージェント以外のアプリが仮想マイクを開いても、録音が始まる。音量メーターを表示する設定ツールは、
-  開いているあいだ録音し続ける。
-- 再接続はしない。切れたら `micmux connect` をやり直す。
-- 同時に動かせる client は 1 つ。接続先では後から接続した方が優先され、前の接続は切れる。
+- **The start of an utterance can be cut off.** The microphone is opened only after the recording request arrives, so
+  sound before it opens is lost. The measured time from START to the first audio is about 110 ms on macOS
+  (Core Audio) and 0.6–1.0 seconds on Linux (ALSA → PulseAudio). From macOS this is barely noticeable in practice, but
+  with Linux as the local side you need to pause briefly after pressing the key before speaking.
+- While sending is stalled, stopping the capture thread waits for the send to finish. If the remote host stops
+  receiving, `micmux disarm` and `q` have no effect in the meantime (they answer `timeout`), and the microphone stays
+  open. Audio after the stop is never sent. To get out, press Ctrl+C or kill the micmux process.
+- The continuous recording limit caps the length of a single recording. While armed, the remote host can start
+  recordings shorter than the limit any number of times by ending and restarting them. Stay disarmed while you do not
+  want to be recorded.
+- When the local side is Linux and neither `XDG_RUNTIME_DIR` nor `TMPDIR` is set, the control socket is placed at
+  `/tmp/micmux-<username>.sock`. If another user on the same machine creates a file with this name first, micmux may
+  fail to start, exit silently believing it joined a running instance, or run without a control socket so that
+  `micmux disarm` does not reach it. This does not happen on macOS, which uses a per-user temporary directory.
+- When `XDG_RUNTIME_DIR` is not set on the remote host, the bridge's lock file is placed in `/tmp`. If another user on
+  the same machine creates a file with this name first, the lock stops working, and if a previous bridge is still
+  around, the virtual mic can break (micmux never stops another user's processes). It is set in a normal SSH login.
+- If the remote host has no sound card and no `arecord`, Claude Code cannot find a way to record.
+  Install `alsa-utils`.
+- The local microphone is always the OS default input device, and all channels are averaged. With multichannel audio
+  interfaces the level drops. If the default input is a pair of Bluetooth earphones, they switch to the call profile
+  every time recording starts ([#12](https://github.com/Daiius/micmux/issues/12)).
+- If audio devices are plugged into or unplugged from the remote host while connected, the default recording device
+  may switch and stay away from the virtual mic ([#13](https://github.com/Daiius/micmux/issues/13)).
+- Apps other than agents also start recording when they open the virtual mic. Settings tools that show a level meter
+  keep recording while they are open.
+- There is no reconnection. If the connection drops, run `micmux connect` again.
+- Only one client can run at a time. On the remote host, the later connection wins and the earlier one is dropped.
 
-## 開発
+## Development
 
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-対応する Rust は 1.89 以降（`Cargo.toml` の `rust-version`）。
+The supported Rust version is 1.89 or later (`rust-version` in `Cargo.toml`).
 
-CI は 3 つある。
+There are three CI workflows.
 
-- `ci`: ビルド・テスト・lint と、音声の通しの試験（`scripts/e2e-linux.sh`）を Linux で回す。`rust-version` の版で
-  ビルドできることも確かめる。文書だけの変更では回らない。macOS 向けのコードは、CI では確かめていない。
-- `audit`: 依存関係を、既知の脆弱性と照合する（`cargo audit`）。週に 1 回も回る。
-- `secret-scan`: 全履歴を Betterleaks で秘密の検査にかける。
+- `ci`: runs build, tests, lint, and the end-to-end audio test (`scripts/e2e-linux.sh`) on Linux. It also checks that
+  the code builds with the `rust-version` toolchain. It does not run for documentation-only changes. Code for macOS is
+  not checked in CI.
+- `audit`: checks dependencies against known vulnerabilities (`cargo audit`). Also runs once a week.
+- `secret-scan`: scans the whole history for secrets with Betterleaks.
 
-### 秘密の検査
+### Secret scanning
 
-公開リポジトリなので、秘密（トークン・`.env*` など）を push の前と CI で止める。規則は `.betterleaks.toml`。
-clone したら、一度だけ次を実行する（git 2.55 以降）。
+Because this is a public repository, secrets (tokens, `.env*` files, and so on) are blocked before push and in CI.
+The rules are in `.betterleaks.toml`. After cloning, run the following once (git 2.55 or later).
 
 ```sh
 ./.githooks/install.sh
 ```
 
-push の前に、送るコミットだけが検査される。Betterleaks が入っていないホストでは、警告して素通りする
-（CI が最後の砦）。
+Before a push, only the commits being sent are scanned. On hosts without Betterleaks, the hook warns and lets the push
+through (CI is the final safeguard).
 
-Linux を接続元にして内蔵のマイク取得を使う場合は `--features native` でビルドする（`libasound2-dev` が必要）。
+To use the built-in microphone capture with Linux as the local side, build with `--features native` (requires `libasound2-dev`).

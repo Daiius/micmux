@@ -15,11 +15,11 @@
 
 set -euo pipefail
 
-BIN="${1:?使い方: $0 <micmux のバイナリ>}"
+BIN="${1:?usage: $0 <micmux binary>}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-[ -x "$BIN" ] || { echo "実行できません: $BIN" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 2; }
 for c in pulseaudio pactl pacat parec python3; do
-  command -v "$c" >/dev/null || { echo "$c がありません" >&2; exit 2; }
+  command -v "$c" >/dev/null || { echo "$c not found" >&2; exit 2; }
 done
 
 W="$(mktemp -d)"
@@ -75,24 +75,24 @@ PY
 status_has() { "$BIN" status 2>/dev/null | grep -q "$1"; }
 sink_exists() { pactl list short sinks | cut -f2 | grep -qx "$1"; }
 
-echo "== 専用の音声サーバーを立てる"
+echo "== start a dedicated sound server"
 # D-Bus を切り離さないと、利用者の音声サーバーと名前が衝突して起動しない
 # module-always-sink: 実体のある出力先が無いときの代役（auto_null）を置く。ヘッドレスのサーバーと同じ状態にする
 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent pulseaudio -n \
   -L "module-native-protocol-unix socket=$W/pulse-rt/native" -L module-always-sink \
   --daemonize=no --exit-idle-time=-1 --use-pid-file=no --log-target="file:$W/pulse.log" &
 PIDS+=($!)
-wait_for 10 pactl info || fail "音声サーバーが起動しない"
-pactl info | grep -q "$W" || fail "専用の音声サーバーに繋がっていない"
-ok "音声サーバー"
+wait_for 10 pactl info || fail "sound server did not start"
+pactl info | grep -q "$W" || fail "not connected to the dedicated sound server"
+ok "sound server"
 
-echo "== client と bridge をつなぐ"
+echo "== connect client and bridge"
 CAPTURE=(--capture-cmd "parec --device=fakemic.monitor --raw --rate=16000 --channels=1 --format=s16le --latency-msec=20")
 if [ "${E2E_NATIVE:-0}" = 1 ]; then
   # 内蔵の取得（cpal → ALSA → PulseAudio）。既定の録音デバイスの代わりに、代役のマイクを指す
   CAPTURE=()
   export PULSE_SOURCE=fakemic.monitor
-  echo "   （内蔵のマイク取得を使う）"
+  echo "   (using built-in capture)"
 fi
 "$BIN" connect --armed --max-seconds 0 --transport "$BIN bridge --sink-name e2e" "${CAPTURE[@]}" \
   </dev/null >"$W/client.log" 2>&1 &
@@ -100,16 +100,16 @@ CLIENT=$!
 PIDS+=("$CLIENT")
 # client の中の PULSE_SOURCE は取得のためのもの。以降の parec には効かせない
 unset PULSE_SOURCE
-wait_for 15 grep -q '接続しました' "$W/client.log" || fail "client が接続しない"
-status_has 'armed=true' || fail "armed になっていない"
-wait_for 5 sink_exists e2e || fail "仮想マイクが作られない"
-ok "接続と仮想マイク"
+wait_for 15 grep -q 'connected to' "$W/client.log" || fail "client did not connect"
+status_has 'armed=true' || fail "not armed"
+wait_for 5 sink_exists e2e || fail "virtual mic was not created"
+ok "connection and virtual mic"
 
-echo "== 仮想マイクが、既定の出力先になっていない"
-[ "$(pactl get-default-sink)" != e2e ] || fail "仮想マイクが既定の出力先になっている"
-ok "既定の出力先は $(pactl get-default-sink)"
+echo "== the virtual mic is not the default sink"
+[ "$(pactl get-default-sink)" != e2e ] || fail "the virtual mic is the default sink"
+ok "default sink is $(pactl get-default-sink)"
 
-echo "== 代役のマイクに 1 kHz の音を流し続ける"
+echo "== play a continuous 1 kHz tone into the fake mic"
 # bridge より後に作る。先に作ると、これが既定の出力先になってしまい、下の混入の試験にならない
 FAKEMIC_MODULE="$(pactl load-module module-null-sink sink_name=fakemic rate=48000 channels=1 format=s16le)"
 python3 - "$W/tone.raw" <<'PY'
@@ -124,18 +124,18 @@ PY
 TONE=$!
 PIDS+=("$TONE")
 
-echo "== armed: 仮想マイクから録ると、代役のマイクの音が届く"
+echo "== armed: recording from the virtual mic yields the fake mic's tone"
 timeout 4 parec --device=e2e.monitor --raw --rate=16000 --channels=1 --format=s16le >"$W/armed.raw" || true
 read -r rms freq < <(analyze "$W/armed.raw")
-echo "   rms=$rms 周波数=${freq}Hz"
-[ "$rms" -gt 1000 ] || fail "音が届いていない (rms=$rms)"
-[ "$freq" -ge 950 ] && [ "$freq" -le 1050 ] || fail "届いた音の周波数が違う (${freq}Hz)"
-grep -q '録音要求 → START' "$W/client.log" || fail "START が出ていない"
-wait_for 5 grep -q '録音終了 → STOP' "$W/client.log" || fail "STOP が出ていない"
-wait_for 5 status_has 'recording=false' || fail "録音が止まらない"
-ok "転送と、録音要求の開始・終了"
+echo "   rms=$rms freq=${freq}Hz"
+[ "$rms" -gt 1000 ] || fail "no audio arrived (rms=$rms)"
+[ "$freq" -ge 950 ] && [ "$freq" -le 1050 ] || fail "wrong frequency (${freq}Hz)"
+grep -q 'recording requested → START' "$W/client.log" || fail "no START"
+wait_for 5 grep -q 'recording ended → STOP' "$W/client.log" || fail "no STOP"
+wait_for 5 status_has 'recording=false' || fail "recording did not stop"
+ok "forwarding, and start/end of recording requests"
 
-echo "== disarmed: 録音要求を断り、音は届かない。接続先で鳴らした音も混ざらない"
+echo "== disarmed: requests are denied, no audio arrives, and sounds played on the remote side do not leak in"
 "$BIN" disarm >/dev/null
 # 出力先を指定せずに鳴らす（＝既定の出力先へ）。仮想マイクが既定になっていると、ここで混ざる
 python3 - "$W/noise.raw" <<'PY'
@@ -152,19 +152,19 @@ timeout 2 parec --device=e2e.monitor --raw --rate=16000 --channels=1 --format=s1
 read -r rms _ < <(analyze "$W/disarmed.raw")
 echo "   rms=$rms"
 kill "$NOISE" 2>/dev/null || true
-[ "$rms" -lt 50 ] || fail "disarmed なのに音が届いた。接続先で鳴らした音が混ざった可能性もある (rms=$rms)"
-grep -q '録音要求を断りました' "$W/client.log" || fail "断った記録が無い"
-ok "disarmed での拒否"
+[ "$rms" -lt 50 ] || fail "audio arrived while disarmed; playback on this host may have leaked in (rms=$rms)"
+grep -q 'denied a recording request' "$W/client.log" || fail "denial not logged"
+ok "denial while disarmed"
 
-echo "== arm し直すと、また届く"
+echo "== re-arming makes audio arrive again"
 "$BIN" arm >/dev/null
 timeout 3 parec --device=e2e.monitor --raw --rate=16000 --channels=1 --format=s16le >"$W/rearmed.raw" || true
 read -r rms _ < <(analyze "$W/rearmed.raw")
 echo "   rms=$rms"
-[ "$rms" -gt 1000 ] || fail "arm し直しても音が届かない (rms=$rms)"
-ok "arm のし直し"
+[ "$rms" -gt 1000 ] || fail "no audio after re-arming (rms=$rms)"
+ok "re-arm"
 
-echo "== 別の名前の仮想マイクを使う bridge を、もう 1 つつなぐ"
+echo "== connect a second bridge with a differently named virtual mic"
 # 代役のマイクは、ここで片付ける。出力先が micmux のものだけ、という実運用と同じ状態にするため
 kill "$TONE" 2>/dev/null || true
 wait "$TONE" 2>/dev/null || true
@@ -174,23 +174,23 @@ MICMUX_SOCKET="$W/second.sock" "$BIN" connect --transport "$BIN bridge --sink-na
   --capture-cmd "cat /dev/zero" </dev/null >"$W/client2.log" 2>&1 &
 CLIENT2=$!
 PIDS+=("$CLIENT2")
-wait_for 15 grep -q '接続しました' "$W/client2.log" || fail "2 つ目の client が接続しない"
-wait_for 5 sink_exists e2e2 || fail "2 つ目の仮想マイクが作られない"
-ok "2 つ目の接続"
+wait_for 15 grep -q 'connected to' "$W/client2.log" || fail "second client did not connect"
+wait_for 5 sink_exists e2e2 || fail "second virtual mic was not created"
+ok "second connection"
 
-echo "== client が突然終わっても、接続先が元に戻る"
+echo "== the remote side is restored when the client exits abruptly"
 # SIGTERM で即座に落とす。bridge は標準入力の EOF で気づいて後片付けをする
 kill "$CLIENT"
 wait "$CLIENT" 2>/dev/null || true
 gone() { ! sink_exists e2e && ! sink_exists e2e_discard; }
-wait_for 5 gone || fail "仮想マイクか、出力の捨て先が残っている"
-ok "後片付け"
+wait_for 5 gone || fail "the virtual mic or the discard sink is left behind"
+ok "cleanup"
 
-echo "== 1 つ目が先に終わっても、残った仮想マイクは既定の出力先にならない"
+echo "== when the first bridge exits, the remaining virtual mic does not become the default sink"
 # 1 つ目が捨て先を消すと、残る sink は 2 つ目の仮想マイクだけになり、音声サーバーがそれを既定に選ぶ。
 # 2 つ目の bridge がそれに気づいて、自分の捨て先に替える
 moved() { [ "$(pactl get-default-sink)" = e2e2_discard ]; }
-wait_for 5 moved || fail "既定の出力先が $(pactl get-default-sink) のまま"
+wait_for 5 moved || fail "default sink is still $(pactl get-default-sink)"
 ( while cat "$W/noise.raw"; do :; done 2>/dev/null ) \
   | pacat --playback --raw --rate=48000 --channels=1 --format=s16le --latency-msec=50 &
 NOISE=$!
@@ -200,14 +200,14 @@ timeout 2 parec --device=e2e2.monitor --raw --rate=16000 --channels=1 --format=s
 kill "$NOISE" 2>/dev/null || true
 read -r rms _ < <(analyze "$W/second.raw")
 echo "   rms=$rms"
-[ "$rms" -lt 50 ] || fail "接続先で鳴らした音が、残った仮想マイクに混ざった (rms=$rms)"
+[ "$rms" -lt 50 ] || fail "playback on this host leaked into the remaining virtual mic (rms=$rms)"
 kill "$CLIENT2"
 wait "$CLIENT2" 2>/dev/null || true
 gone2() { ! sink_exists e2e2 && ! sink_exists e2e2_discard; }
-wait_for 5 gone2 || fail "2 つ目の仮想マイクか、捨て先が残っている"
-ok "既定の出力先の見直しと、後片付け"
+wait_for 5 gone2 || fail "the second virtual mic or its discard sink is left behind"
+ok "default sink re-check, and cleanup"
 
-echo "== 既定の出力先を確かめられないときは、書き換えない"
+echo "== the default sink is left alone when it cannot be checked"
 # 実体のある出力先の代わりに、スピーカー役の sink を既定にしておく
 pactl load-module module-null-sink sink_name=speaker >/dev/null
 pactl set-default-sink speaker
@@ -224,18 +224,18 @@ MICMUX_SOCKET="$W/third.sock" PATH="$W/fakebin:$PATH" "$BIN" connect \
   --transport "$BIN bridge --sink-name e2e3" --capture-cmd "cat /dev/zero" </dev/null >"$W/client3.log" 2>&1 &
 CLIENT3=$!
 PIDS+=("$CLIENT3")
-wait_for 15 grep -q '接続しました' "$W/client3.log" || fail "3 つ目の client が接続しない"
-[ "$(pactl get-default-sink)" = speaker ] || fail "既定の出力先が書き換えられた ($(pactl get-default-sink))"
-! sink_exists e2e3_discard || fail "確かめられないのに、捨て先を作った"
-grep -q '既定の出力先を確かめられない' "$W/client3.log" || fail "確かめられなかった旨のログが無い"
+wait_for 15 grep -q 'connected to' "$W/client3.log" || fail "third client did not connect"
+[ "$(pactl get-default-sink)" = speaker ] || fail "default sink was changed ($(pactl get-default-sink))"
+! sink_exists e2e3_discard || fail "created a discard sink without being able to check"
+grep -q 'cannot check the default sink' "$W/client3.log" || fail "no log saying the check failed"
 kill "$CLIENT3"
 wait "$CLIENT3" 2>/dev/null || true
 gone3() { ! sink_exists e2e3; }
-wait_for 5 gone3 || fail "3 つ目の仮想マイクが残っている"
-[ "$(pactl get-default-sink)" = speaker ] || fail "終了後に、既定の出力先が変わっていた"
-ok "確かめられないときは触らない"
+wait_for 5 gone3 || fail "third virtual mic is left behind"
+[ "$(pactl get-default-sink)" = speaker ] || fail "default sink changed after exit"
+ok "no changes when the check fails"
 
-echo "== 参考: 録音要求から最初の音声が届くまで"
-grep -o 'START から最初の音声まで [0-9]* ms' "$W/client.log" | sed 's/^/   /' || true
+echo "== info: time from recording request to first audio"
+grep -o 'first audio [0-9]* ms after START' "$W/client.log" | sed 's/^/   /' || true
 
-echo "すべて通りました"
+echo "all passed"

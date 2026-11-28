@@ -14,7 +14,7 @@ ver=$(git --version | awk '{print $3}')
 major=$(printf '%s' "$ver" | cut -d. -f1)
 minor=$(printf '%s' "$ver" | cut -d. -f2)
 if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 55 ]; }; then
-	echo "[hooks] git >= 2.55 が必要です（現在 $ver）。config ベース hooks をスキップします。" >&2
+	echo "[hooks] git >= 2.55 is required (found $ver), skipping config-based hooks" >&2
 	exit 0
 fi
 
@@ -26,4 +26,4 @@ fi
 
 chmod +x .githooks/pre-push 2>/dev/null || true
 
-echo "[hooks] config ベース hooks を有効化しました（pre-push: 秘密の検査）。"
+echo "[hooks] enabled config-based hooks (pre-push: secret scan)"
