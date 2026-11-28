@@ -7,14 +7,19 @@
 SSH 接続元のマイクを、接続先の仮想マイクとして使えるようにする。
 接続先のアプリが録音を始めた瞬間だけ接続元のマイクが起動し、録音が終わると止まる。
 
-```text
-接続元 (macOS)                         接続先 (Debian)
-┌──────────────────────┐   SSH    ┌───────────────────────────────────┐
-│ マイク → micmux connect ├─────────┤ micmux bridge → 仮想マイク → アプリ │
-└──────────────────────┘ stdin/out └───────────────────────────────────┘
-        ← START / STOP（録音要求）
-        → PCM（armed のときだけ）
+```mermaid
+flowchart LR
+  subgraph local["接続元 (macOS)"]
+    mic(["マイク"]) --> connect["micmux connect"]
+  end
+  subgraph remote["接続先 (Debian)"]
+    bridge["micmux bridge"] --> vmic(["仮想マイク"]) --> app["アプリ"]
+  end
+  connect -- "音声（PCM）。armed のときだけ" --> bridge
+  bridge -. "START / STOP（録音要求）" .-> connect
 ```
+
+`micmux connect` と `micmux bridge` のあいだの 2 本の矢印は、どちらも 1 本の SSH 接続（`ssh` の標準入出力）を通る。
 
 音声は端末の入出力とは別の経路（専用の SSH 接続、または多重化した別チャネル）で送るので、
 tmux やターミナルエミュレーターには依存しない。

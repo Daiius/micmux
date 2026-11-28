@@ -7,14 +7,20 @@
 micmux lets you use the microphone on your SSH client machine as a virtual microphone on the remote host.
 The local microphone turns on only at the moment an app on the remote host starts recording, and turns off when recording ends.
 
-```text
-Local (macOS)                      Remote (Debian)
-┌──────────────────────┐    SSH    ┌───────────────────────────────────┐
-│ mic → micmux connect ├───────────┤ micmux bridge → virtual mic → app │
-└──────────────────────┘ stdin/out └───────────────────────────────────┘
-        ← START / STOP (recording requests)
-        → PCM (only while armed)
+```mermaid
+flowchart LR
+  subgraph local["Local (macOS)"]
+    mic(["Microphone"]) --> connect["micmux connect"]
+  end
+  subgraph remote["Remote (Debian)"]
+    bridge["micmux bridge"] --> vmic(["Virtual mic"]) --> app["App"]
+  end
+  connect -- "audio (PCM), only while armed" --> bridge
+  bridge -. "START / STOP (recording requests)" .-> connect
 ```
+
+Both arrows between `micmux connect` and `micmux bridge` travel over one SSH connection (the standard input and
+output of `ssh`).
 
 Audio travels on a path separate from the terminal's input and output (a dedicated SSH connection, or a separate
 channel on a multiplexed one), so micmux does not depend on tmux or the terminal emulator.
