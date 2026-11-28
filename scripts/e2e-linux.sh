@@ -42,8 +42,13 @@ FAILED=0
 # ここから先は、すべて専用の音声サーバーと専用のソケットに向く
 export PULSE_RUNTIME_PATH="$W/pulse-rt" PULSE_STATE_PATH="$W/pulse-state" PULSE_SERVER="unix:$W/pulse-rt/native"
 export MICMUX_SOCKET="$W/micmux.sock" XDG_STATE_HOME="$W/state" XDG_RUNTIME_DIR="$W/rt"
+# 利用者の設定（~/.config/pulse・pipewire・wireplumber）を読ませない
+export XDG_CONFIG_HOME="$W/config"
 unset PULSE_SINK PULSE_SOURCE
-mkdir -p "$W/pulse-rt" "$W/rt"
+# PipeWire は、XDG_RUNTIME_DIR よりこれらを優先する。残っていると、利用者の PipeWire に繋がってしまう
+unset PIPEWIRE_RUNTIME_DIR PIPEWIRE_REMOTE PIPEWIRE_CONFIG_DIR PIPEWIRE_CONFIG_NAME PIPEWIRE_NODE
+unset WIREPLUMBER_CONFIG_DIR WIREPLUMBER_DATA_DIR
+mkdir -p "$W/pulse-rt" "$W/rt" "$W/config"
 
 cleanup() {
   local p
@@ -94,7 +99,26 @@ echo "== start a dedicated sound server"
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent
 if [ "$SERVER" = pipewire ]; then
   # ソケットは XDG_RUNTIME_DIR と PULSE_RUNTIME_PATH の下にできるので、利用者のものとは別になる。
-  # 実体のある出力先が無いときの代役（auto_null）は、pipewire-pulse が自分で置く
+  # 実体のある出力先が無いときの代役（auto_null）は、pipewire-pulse が自分で置く。
+  #
+  # WirePlumber は、既定では実際のデバイス（ALSA・Bluetooth・カメラ）を探して掴む。試験用の
+  # インスタンスがそれをすると、利用者の音声サーバーとデバイスを取り合う。デバイスの監視を止める。
+  # この書き方（wireplumber.profiles）は 0.5 以降のもの。0.4 は設定の形式が違うので、回さない
+  case "$(wireplumber --version 2>/dev/null | sed -n 's/^Linked with libwireplumber //p')" in
+    0.[0-4].*|"") fail "E2E_SERVER=pipewire needs WirePlumber 0.5 or later" ;;
+  esac
+  mkdir -p "$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d"
+  cat >"$XDG_CONFIG_HOME/wireplumber/wireplumber.conf.d/90-e2e-no-hardware.conf" <<'CONF'
+wireplumber.profiles = {
+  main = {
+    hardware.audio = disabled
+    hardware.bluetooth = disabled
+    hardware.video-capture = disabled
+  }
+}
+CONF
+  # Bluetooth は system bus を通るので、こちらも切り離す
+  export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent
   pipewire >"$W/pipewire.log" 2>&1 &
   PIDS+=($!)
   wait_for 10 test -S "$XDG_RUNTIME_DIR/pipewire-0" || fail "pipewire did not start"
@@ -115,6 +139,11 @@ if [ "$SERVER" = pipewire ]; then
   pactl info | grep -q 'Server Name:.*PipeWire' || fail "the sound server is not PipeWire"
   # 代役の出力先は、WirePlumber が動き出してから現れる
   wait_for 10 sink_exists auto_null || fail "the placeholder sink did not appear"
+  # 念のための歯止め。監視を止めたのに実際のデバイスが見えていたら、先へ進まない
+  # （既定の出力先へ鳴らす試験が、本物のスピーカーから鳴ってしまう）
+  sleep 0.5
+  [ "$(pactl list short sinks | cut -f2)" = auto_null ] \
+    || fail "the dedicated sound server sees real devices: $(pactl list short sinks | cut -f2 | tr '\n' ' ')"
 fi
 ok "sound server ($(pactl info | sed -n 's/^Server Name: //p'))"
 

@@ -93,7 +93,10 @@ cargo build --release
 
 `E2E_SERVER=pipewire` を付けると、PulseAudio の代わりに PipeWire（pipewire-pulse + WirePlumber）で回す。
 PipeWire が入っていないマシンでは、コンテナの中で回す（`pipewire`・`pipewire-pulse`・`wireplumber`・
-`pulseaudio-utils`、内蔵の取得には `pipewire-alsa` も要る）。`pipewire-alsa` と `libasound2-plugins` は
+`pulseaudio-utils`、内蔵の取得には `pipewire-alsa` も要る。WirePlumber は 0.5 以降）。
+試験用の WirePlumber は、実際のデバイス（ALSA・Bluetooth・カメラ）の監視を止めて起動し、利用者の設定
+（`~/.config`）と `PIPEWIRE_REMOTE` などの環境変数も読ませない。利用者の音声サーバーとデバイスを
+取り合わないためである。`pipewire-alsa` と `libasound2-plugins` は
 ALSA の既定デバイスを取り合うので、同じ環境に両方を入れない。
 
 ### client と bridge を 1 台の中でつなぐ
