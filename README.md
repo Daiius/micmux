@@ -44,7 +44,9 @@ As of 2026-11-27. Voice input into Claude Code from macOS to Debian over a real 
 | Automatic start from `LocalCommand`, running in the background | Confirmed by testing on macOS |
 | Sharing the connection with `--mux` (authenticate once), starting from `Match exec` | Confirmed by testing on macOS with a fingerprint-protected key |
 | Microphone permission when running in the background | Confirmed by testing on macOS (same level as when run directly from the terminal) |
-| pipewire-pulse on the remote host | Passes the end-to-end test in CI and in a container (PipeWire 1.4.2 on Debian 13), including recording through ALSA and `--set-default`. Not tested on a machine with real audio devices. The remote host in daily use runs PulseAudio 17.0 |
+| PulseAudio 17.0 on the remote host | Confirmed by testing. Audio from the virtual mic arrives 1–2 seconds late, though (see Known limitations) |
+| PipeWire 1.4.2 on the remote host (Debian 13) | Confirmed by testing. The remote host in daily use runs this |
+| PipeWire 1.6.x on the remote host | Passes the end-to-end test in CI and in containers (1.6.2, 1.6.9, 1.6.11). Not tested on a real remote host |
 | Codex CLI | Not tested. The 0.162.1 Linux binary appears to have no recording implementation (see below) |
 
 ## Setup
@@ -166,6 +168,10 @@ the app you want at the virtual mic with an environment variable.
 PULSE_SOURCE=micmux.monitor claude
 ```
 
+The device that becomes the default depends on the sound server: `micmux.monitor` on PulseAudio, and `micmux_mic` on
+PipeWire (a separate recording device created only to serve as the default). The name to use with `PULSE_SOURCE` is
+`micmux.monitor` on both.
+
 ### Main options
 
 | Option | Meaning |
@@ -280,6 +286,18 @@ You can check these numbers in the log from a background run and in the `rtt` of
   sound before it opens is lost. The measured time from START to the first audio is about 110 ms on macOS
   (Core Audio) and 0.6–1.0 seconds on Linux (ALSA → PulseAudio). From macOS this is barely noticeable in practice, but
   with Linux as the local side you need to pause briefly after pressing the key before speaking.
+- **With PulseAudio on the remote host, audio arrives 1–2 seconds late.** Nothing is lost, but if you stop recording
+  right after you finish speaking, the end is cut off. This comes from PulseAudio's virtual devices and happens
+  without micmux too ([#15](https://github.com/Daiius/micmux/issues/15)). With PipeWire the delay is about
+  0.15 seconds. To switch a Debian remote host to PipeWire, use `scripts/switch-debian-server-to-pipewire.sh`
+  (`--check` shows what would change without changing anything; `--rollback` goes back). PipeWire runs three
+  processes instead of one, and the version in Debian 13 stable has unfixed vulnerabilities
+  ([prd/05](./prd/05-security.md) §3.7, in Japanese).
+- **PipeWire behaves differently between versions.** Tested versions are 1.4.2 and 1.6.x (1.6.2, 1.6.9, 1.6.11).
+  1.6.x handles the default recording device differently from 1.4.x, and micmux works around it by creating a
+  separate recording device when `--set-default` is given ([#18](https://github.com/Daiius/micmux/issues/18)). If you
+  make `micmux.monitor` the default recording device yourself instead of using `--set-default`, recording does not
+  reach the virtual mic on 1.6.x.
 - While sending is stalled, stopping the capture thread waits for the send to finish. If the remote host stops
   receiving, `micmux disarm` and `q` have no effect in the meantime (they answer `timeout`), and the microphone stays
   open. Audio after the stop is never sent. To get out, press Ctrl+C or kill the micmux process.
